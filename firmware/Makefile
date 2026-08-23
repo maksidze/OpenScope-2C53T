@@ -1,6 +1,10 @@
 # Makefile for FNIRSI 2C53T Custom Firmware
 # Target: Artery AT32F403A (ARM Cortex-M4F @ 240MHz)
 
+# A bare `make` is the stock-IAP guest image.  Keep standalone `all` for
+# explicitly building the HID-bootloader application layout.
+.DEFAULT_GOAL := guest
+
 ######################################################################
 # Toolchain
 ######################################################################
@@ -10,7 +14,13 @@ AS      = $(PREFIX)gcc -x assembler-with-cpp
 CP      = $(PREFIX)objcopy
 SZ      = $(PREFIX)size
 OBJDUMP = $(PREFIX)objdump
+# Windows GNU Make has no POSIX shell by default.  Select newlib-nano directly
+# instead of probing for its specs file with the POSIX `test` command.
+ifeq ($(OS),Windows_NT)
+NANO_SPECS := -specs=nano.specs
+else
 NANO_SPECS := $(shell f="$(shell $(CC) -print-file-name=nano.specs 2>/dev/null)"; test "$$f" != "nano.specs" -a -f "$$f" && printf '%s' '-specs=nano.specs')
+endif
 HOST_CC ?= gcc
 
 ######################################################################
@@ -257,7 +267,13 @@ $(BUILD_DIR)/$(TARGET).elf: $(OBJECTS) Makefile $(LDSCRIPT)
 
 $(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/option_bytes48.bin
 	$(CP) -O binary --gap-fill 0xFF $< $@
+
+ifeq ($(OS),Windows_NT)
+	@echo Built: $@
+	@powershell.exe -NoProfile -Command "(Get-Item '$@').Length"
+else
 	@echo "Built: $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+endif
 
 # One-shot option-byte blob for first-time DFU setup.
 # Writes the AT32F403A User System Data region at 0x1FFFF800 so EOPB0 = 0xFE,
@@ -284,20 +300,36 @@ $(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/option_bytes
 #
 # Flashed via: dfu-util -a 1 -d 2e3c:df11 -s 0x1FFFF800 -D build/option_bytes48.bin
 $(BUILD_DIR)/option_bytes48.bin: Makefile | $(BUILD_DIR)
+
+ifeq ($(OS),Windows_NT)
+	@powershell.exe -NoProfile -Command "[IO.File]::WriteAllBytes('$@', [byte[]](0xA5,0x5A,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFE,0x01,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF))"
+	@echo "Built: $@ (48 bytes) — EOPB0=0xFE, 224KB SRAM"
+else
 	@printf '\245\132\377\000\377\000\377\000\377\000\377\000\377\000\377\000\376\001\377\000\377\000\377\000\377\000\377\000\377\000\377\000\377\377\377\377\377\377\377\377\377\377\377\377\377\377\377\377' > $@
 	@echo "Built: $@ ($$(wc -c < $@ | tr -d ' ') bytes) — EOPB0=0xFE, 224KB SRAM"
+endif
 
 $(BUILD_DIR)/$(TARGET).hex: $(BUILD_DIR)/$(TARGET).elf
 	$(CP) -O ihex $< $@
 
 $(BUILD_DIR):
+
+ifeq ($(OS),Windows_NT)
+	@if not exist "$@" mkdir "$@"
+else
 	mkdir -p $@
+endif
 
 ######################################################################
 # Utility targets
 ######################################################################
 clean:
+
+ifeq ($(OS),Windows_NT)
+	@if exist "$(BUILD_DIR)" rmdir /S /Q "$(BUILD_DIR)"
+else
 	rm -rf $(BUILD_DIR)
+endif
 
 disasm: $(BUILD_DIR)/$(TARGET).elf
 	$(OBJDUMP) -d -S $< > $(BUILD_DIR)/$(TARGET).dis
