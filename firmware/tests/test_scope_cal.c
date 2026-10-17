@@ -175,18 +175,18 @@ static void test_labels(void)
     CHECK(buf[0] != '~', "r6 is MEASURED and must not be marked, got \"%s\"", buf);
     CHECK(strchr(buf, 'V') != NULL, "r6 label should carry units, got \"%s\"", buf);
 
-    /* 42.95 mV/count * 32 counts/div = 1.3744 V/div. */
-    CHECK(strcmp(buf, "1.37V") == 0,
-          "r6 label should be derived as 1.37V, got \"%s\"", buf);
+    /* 42.95 mV/count * 0.92 source-scale * 32 counts/div = 1.2645 V/div. */
+    CHECK(strcmp(buf, "1.26V") == 0,
+          "r6 label should be derived as 1.26V, got \"%s\"", buf);
 
     /* Provisional -> same number, marked. */
     scope_cal_range_label(1, 9, buf, sizeof(buf));
     CHECK(buf[0] == '~', "r9 is PROVISIONAL and must be marked, got \"%s\"", buf);
 
-    /* Sub-volt divisions read in mV. 21.83 * 32 = 698.6 mV. */
+    /* Sub-volt divisions read in mV. 21.83 * 0.92 * 32 = 642.7 mV. */
     scope_cal_range_label(1, 5, buf, sizeof(buf));
-    CHECK(strcmp(buf, "699mV") == 0,
-          "r5 label should be derived as 699mV, got \"%s\"", buf);
+    CHECK(strcmp(buf, "643mV") == 0,
+          "r5 label should be derived as 643mV, got \"%s\"", buf);
 
     /*
      * And the point of the whole exercise: the derived label must NOT equal
@@ -204,15 +204,83 @@ static void test_labels(void)
     CHECK(small[2] == '\0', "label must NUL-terminate within a 3-byte buffer");
 }
 
+/* The true-scale render gate (M3) must agree, range for range, with whether a
+ * volts/div exists: calibrated -> render true scale; NONE / out-of-domain ->
+ * autofit. If these two ever disagree, the grid would claim a volts/div the
+ * badges refuse to print (or vice versa) — the exact class of inconsistency
+ * scope_cal exists to prevent. */
+static void test_true_scale_gate_matches_calibration(void)
+{
+    for (uint8_t ch = 1; ch <= 2; ch++) {
+        for (uint8_t r = 0; r < SCOPE_CAL_RANGE_COUNT; r++) {
+            int ok   = scope_cal_true_scale_ok(ch, r);
+            int cal  = scope_cal_volts_per_count(ch, r) > 0.0f;
+            CHECK(!!ok == cal,
+                  "ch%u r%u: true_scale_ok(%d) must match has-cal(%d)",
+                  ch, r, ok, cal);
+        }
+        /* Ranges 0-3 rail -> must autofit; 5/6/7 are MEASURED -> true scale. */
+        for (uint8_t r = 0; r <= 3; r++)
+            CHECK(!scope_cal_true_scale_ok(ch, r),
+                  "ch%u r%u: railed range must NOT render true scale", ch, r);
+        for (uint8_t r = 5; r <= 7; r++)
+            CHECK(scope_cal_true_scale_ok(ch, r),
+                  "ch%u r%u: measured range must render true scale", ch, r);
+    }
+    /* Out-of-domain is a refusal, same as everywhere else in this module. */
+    CHECK(!scope_cal_true_scale_ok(0, 6), "ch0 must not render true scale");
+    CHECK(!scope_cal_true_scale_ok(1, SCOPE_CAL_RANGE_COUNT),
+          "range past the end must not render true scale");
+}
+
+/* Probe factor (2026-10-03): the readout scales, the calibration table does
+ * not, and only the channel with the 10x probe moves. Control: with no
+ * source registered every number is exactly what it was. */
+static float probe_ch2_x10(uint8_t ch) { return ch == 2u ? 10.0f : 1.0f; }
+static float probe_bad(uint8_t ch)     { (void)ch; return -3.0f; }
+
+static void test_probe_factor(void)
+{
+    const uint8_t r = 6;                       /* a MEASURED range */
+    scope_cal_set_probe_source(NULL);
+    const float v1 = scope_cal_volts_per_count(1, r), v2 = scope_cal_volts_per_count(2, r);
+    const float m2 = scope_cal_mv_per_count(2, r), d2 = scope_cal_volts_per_div(2, r);
+    char l_before[12], l_after[12];
+    scope_cal_range_label(2, r, l_before, sizeof(l_before));
+    CHECK(v2 > 0.0f && scope_cal_probe_factor(2) == 1.0f, "no source: factor 1");
+
+    scope_cal_set_probe_source(probe_ch2_x10);
+    CHECK(scope_cal_volts_per_count(2, r) == v2 * 10.0f, "CH2 10x: volts/count x10");
+    CHECK(scope_cal_volts_per_div(2, r) == d2 * 10.0f, "CH2 10x: volts/div x10");
+    CHECK(scope_cal_mv_per_count(2, r) == m2, "CH2 10x: the cal table must not move");
+    CHECK(scope_cal_volts_per_count(1, r) == v1, "CH1 1x: unchanged");
+    scope_cal_range_label(2, r, l_after, sizeof(l_after));
+    CHECK(strcmp(l_before, l_after) != 0, "CH2 label must change (%s -> %s)", l_before, l_after);
+    {
+        char bnc[12];
+        scope_cal_range_label_bnc(2, r, bnc, sizeof(bnc));
+        CHECK(strcmp(bnc, l_before) == 0, "BNC label ignores the probe (%s vs %s)", bnc, l_before);
+    }
+    CHECK(scope_cal_volts_per_count(2, 0) == 0.0f, "an uncalibrated range stays 0 at 10x");
+    CHECK(scope_cal_true_scale_ok(2, r), "true-scale gate unaffected by the probe");
+
+    scope_cal_set_probe_source(probe_bad);
+    CHECK(scope_cal_volts_per_count(2, r) == v2, "a nonsense factor falls back to 1");
+    scope_cal_set_probe_source(NULL);
+    CHECK(scope_cal_volts_per_count(2, r) == v2, "unregistering restores 1x");
+}
+
 int main(void)
 {
     test_uncalibrated_ranges_return_zero();
     test_out_of_domain_arguments();
+    test_true_scale_gate_matches_calibration();
     test_source_scale_is_uniform();
     test_measured_tier_claims_hold();
     test_provisional_ranges_still_produce_a_number();
     test_volts_per_div_is_derived();
     test_labels();
+    test_probe_factor();
 
     if (failures == 0) {
         printf("test_scope_cal: all checks passed\n");

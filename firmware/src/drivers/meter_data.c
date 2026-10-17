@@ -153,8 +153,8 @@ static uint16_t meter_aux_freq_i10(const meter_reading_t *r)
         strcmp(old_unit_suffix, r->unit_suffix ? r->unit_suffix : "") != 0) { \
         r->display_update_count++; \
     } \
+    meter_record_history();     /* inside the seqlock: see meter_data_recent_dc_mv */ \
     meter_reading_write_end(); \
-    meter_record_history(); \
     meter_writer_lock_release(); \
 } while (0)
 
@@ -182,8 +182,8 @@ static uint16_t meter_aux_freq_i10(const meter_reading_t *r)
         strcmp(old_unit_suffix, r->unit_suffix ? r->unit_suffix : "") != 0) { \
         r->display_update_count++; \
     } \
+    meter_record_history();     /* inside the seqlock: see meter_data_recent_dc_mv */ \
     meter_reading_write_end(); \
-    meter_record_history(); \
     meter_writer_lock_release(); \
 } while (0)
 
@@ -493,6 +493,19 @@ static uint8_t observed_frame_family(uint8_t expected_family,
     if (fpga_meter_frame_family_has_stock_marker(
             (uint8_t)FPGA_METER_FRAME_FAMILY_VOLTAGE) &&
         frame_has_voltage_payload_marker(frame)) {
+        /* A diode test IS a voltage measurement on this SoC: it carries the
+         * voltage marker, and frame[6]'s upper nibble -- an annunciator
+         * field, outside the digit nibbles -- says which function. 8 = diode
+         * on every diode frame we have (unit #1 1N4007 0x8B and red LED 0x8F
+         * against a DMC100, 2026-10-05; unit #2's open-diode frame 0x80,
+         * EXP-206), 0 on every DC-volts frame. Until 2026-10-05 all diode
+         * frames were classified VOLTAGE and rejected in diode mode, which
+         * EXP-206 had marked "the expected negative" with no diode on the
+         * leads. Classifying by the annunciator keeps the stale-frame guard
+         * both ways: a DCV frame in diode mode, or a diode frame in DCV mode,
+         * is still the wrong family. */
+        if ((frame[6] & 0xF0U) == 0x80U)
+            return (uint8_t)FPGA_METER_FRAME_FAMILY_DIODE;
         return (uint8_t)FPGA_METER_FRAME_FAMILY_VOLTAGE;
     }
     return expected_family;
@@ -1064,9 +1077,14 @@ static bool apply_stock_dcv_decimal_exponent(meter_reading_t *r,
 static bool frame_is_voltage_payload(uint8_t submode,
                                      const volatile uint8_t *frame)
 {
+    /* A voltage-marked frame outside the voltage functions is a stale DC/AC
+     * frame from before a mode change -- UNLESS frame[6]'s annunciator says
+     * it is a diode measurement (observed_frame_family above), in which case
+     * it belongs to diode mode and frame_family_mismatch() decides. */
     return fpga_meter_frame_family_for_submode(submode) !=
            FPGA_METER_FRAME_FAMILY_VOLTAGE &&
-           frame_has_voltage_payload_marker(frame);
+           frame_has_voltage_payload_marker(frame) &&
+           (frame[6] & 0xF0U) != 0x80U;
 }
 
 static bool frame_family_mismatch(const meter_reading_t *r)
@@ -1108,15 +1126,36 @@ static bool frame_has_ac_evidence(uint8_t submode,
            frame_extra_is_empirical_line_frequency_hint(extra);
 }
 
-static bool resistance_low_ohm_calibration_unresolved(uint8_t submode,
-                                                      uint8_t flags)
-{
-    return (submode == 6 || submode == 7) && ((flags & 0xF0U) == 0x00U);
-}
-
 /* ═══════════════════════════════════════════════════════════════════
  * Format value into display string
  * ═══════════════════════════════════════════════════════════════════ */
+
+/* Five-digit text: the leading digit (1 when bcd_value >= 10000, else 0) and
+ * the four frame digits, with `decimals` digits after the point (0..4). Sets
+ * display_str and value; the sign comes from r->negative. Integer-only
+ * formatting: newlib-nano has no %f. */
+static void format_5digit(meter_reading_t *r, uint8_t decimals)
+{
+    char *s = r->display_str;
+    char digits[5];
+    digits[0] = (char)('0' + (r->bcd_value >= 10000 ? 1 : 0));
+    for (int i = 0; i < 4; i++) digits[i + 1] = (char)('0' + r->digits[i]);
+    if (decimals > 4) decimals = 4;
+    int point = 5 - (int)decimals;          /* index the point precedes */
+    int first = 0;                          /* drop leading zeros before the point */
+    while (first < point - 1 && digits[first] == '0') first++;
+    int pos = 0;
+    if (r->negative) s[pos++] = '-';
+    for (int i = first; i < 5; i++) {
+        if (i == point && decimals > 0) s[pos++] = '.';
+        s[pos++] = digits[i];
+    }
+    s[pos] = '\0';
+    float div = 1.0f;
+    for (uint8_t i = 0; i < decimals; i++) div *= 10.0f;
+    r->value = (float)r->bcd_value / div;
+    if (r->negative) r->value = -r->value;
+}
 
 static void format_reading(meter_reading_t *r, uint8_t submode)
 {
@@ -1138,12 +1177,15 @@ static void format_reading(meter_reading_t *r, uint8_t submode)
     s[pos] = '\0';
 
     /* Strip leading zeros (but keep at least one digit before decimal) */
-    /* e.g., "0.623" stays, but "0047" becomes "47" */
-    if (dec == 0) {
-        /* No decimal point — strip leading zeros */
+    /* e.g., "0.623" stays, but "0047" becomes "47" and "00.17" becomes "0.17" */
+    {
         int start = r->negative ? 1 : 0;
+        int point = start;
+        while (point < pos && s[point] != '.') {
+            point++;
+        }
         int first_nonzero = start;
-        while (first_nonzero < pos - 1 && s[first_nonzero] == '0') {
+        while (first_nonzero < point - 1 && s[first_nonzero] == '0') {
             first_nonzero++;
         }
         if (first_nonzero > start) {
@@ -1204,6 +1246,64 @@ bool meter_data_snapshot(meter_reading_t *out)
     }
 
     return false;
+}
+
+/* "-0.0009" -> -0.0009. By hand: strtof costs 16 KB of flash. */
+static bool parse_decimal(const char *p, float *out)
+{
+    bool neg = false, digits = false;
+    int32_t v = 0, div = 1;
+    if (*p == '-' || *p == '+') neg = (*p++ == '-');
+    for (; *p >= '0' && *p <= '9'; p++) { v = v * 10 + (*p - '0'); digits = true; }
+    if (*p == '.')
+        for (p++; *p >= '0' && *p <= '9' && div < 100000000; p++) {
+            v = v * 10 + (*p - '0'); div *= 10; digits = true;
+        }
+    if (!digits) return false;
+    *out = (neg ? -(float)v : (float)v) / (float)div;
+    return true;
+}
+
+uint8_t meter_data_recent_dc_mv(float *mv, uint8_t max)
+{
+    char str[METER_FRAME_HISTORY_LEN][16];
+    const char *unit[METER_FRAME_HISTORY_LEN];
+    uint8_t n = 0;
+    if (max > METER_FRAME_HISTORY_LEN) max = METER_FRAME_HISTORY_LEN;
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint32_t before = meter_reading_seq;
+        meter_data_barrier();
+        if ((before & 1U) != 0U) continue;
+
+        uint8_t count = meter_frame_history_count;
+        if (count > max) count = max;
+        n = 0;
+        for (uint8_t k = 0; k < count; k++) {
+            const meter_frame_history_t *h = &meter_frame_history[
+                (meter_frame_history_head + METER_FRAME_HISTORY_LEN - 1U - k) % METER_FRAME_HISTORY_LEN];
+            if (h->submode != 0) break;
+            memcpy(str[n], h->display_str, sizeof str[n]);
+            str[n][sizeof str[n] - 1] = '\0';
+            unit[n] = h->unit_suffix;
+            n++;
+        }
+
+        meter_data_barrier();
+        uint32_t after = meter_reading_seq;
+        if (before == after && (after & 1U) == 0U) break;
+        n = 0;
+    }
+
+    uint8_t k;
+    for (k = 0; k < n; k++) {
+        float v;
+        if (!unit[k] || !parse_decimal(str[k], &v)) break;  /* "---", "OL" */
+        if (strcmp(unit[k], "V") == 0)       mv[k] = v * 1000.0f;
+        else if (strcmp(unit[k], "mV") == 0) mv[k] = v;
+        else break;
+    }
+    return k;
 }
 
 void meter_data_invalidate(uint8_t submode)
@@ -1328,12 +1428,66 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
             (uint8_t)FPGA_METER_FRAME_FAMILY_CONTINUITY;
     }
 
+    /*
+     * THE FRAME IS SEVEN-SEGMENT TEXT (issue #15, EXP-27 on unit #1, EXP-205
+     * on unit #2). Two things the segment lookup throws away are meaning:
+     *
+     *  - bit 4 of a digit's nibble is its DECIMAL POINT, lit on the digit the
+     *    point precedes. The SoC draws "9.924", " 0.17", "9.623" with it, and
+     *    "2168", "2978" without. Exactly one lit DP is a decimal position;
+     *    none means the text is an integer or the submode's own rule applies.
+     *    DCV is excluded here: its point rides the stock range classes and the
+     *    +10000 extension below, which were measured separately.
+     *  - a leading blank glyph is a leading SPACE: " 0.17", "  28". Those
+     *    digits are zeros for the value and nothing for the display; they are
+     *    not the blank/partial-blank special frames, which are blank all the
+     *    way through.
+     */
+    /* nib0's bit 4 is NOT a point: it is frame[2] bit 4, the minus sign
+     * (stock's VNEG at 0x08037166; a point before the first digit would have
+     * nothing to separate). Counting it here made every negative reading
+     * outside DCV carry two "points" and lose its real one (2026-10-03,
+     * @saulvalenzuela23's #37 frames). */
+    (void)nib0;
+    uint8_t dp_bits = (uint8_t)(((nib1 & 0x10U) ? 2U : 0U) |
+                                ((nib2 & 0x10U) ? 4U : 0U) | ((nib3 & 0x10U) ? 8U : 0U));
+    uint8_t frame_dp = (dp_bits == 2U) ? 1U : (dp_bits == 4U) ? 2U : (dp_bits == 8U) ? 3U : 0U;
+    uint8_t text_codes[4] = { digit0, digit1, digit2, digit3 };
+    uint8_t leading_blanks = 0;
+    bool text_numeric = false;
+    while (leading_blanks < 3U && text_codes[leading_blanks] == 0x10U) {
+        leading_blanks++;
+    }
+    if (leading_blanks > 0) {
+        text_numeric = true;
+        for (uint8_t k = leading_blanks; k < 4U; k++) {
+            if (text_codes[k] > 9U) text_numeric = false;
+        }
+    }
+    if (text_numeric) {
+        for (uint8_t k = 0; k < leading_blanks; k++) text_codes[k] = 0;
+        digit0 = text_codes[0];
+        digit1 = text_codes[1];
+        digit2 = text_codes[2];
+        digit3 = text_codes[3];
+    }
+
     /* Parse status flags from byte [7]. The stock parser treats this as the
      * status byte for data frames and as an integrity marker for echo frames. */
     uint8_t status = frame[7];
-    r->is_ac = (status & (1 << 2)) != 0;
+    /* Bit 2 is the x100 range in resistance and continuity, not AC: the
+     * 300 kOhm reading of EXP-206 carries frame[7] = 0x24. Gate the AC
+     * diagnostic by submode, as frame[7] bit 0 is gated below. */
+    r->is_ac = (submode != 6 && submode != 7) && (status & (1 << 2)) != 0;
     r->is_auto_range = (status & (1 << 3)) != 0;
-    r->negative = ((submode == 0 || submode == 2 || submode == 3) &&
+    /* The sign is frame[2] bit 4 in every function: stock negates on it
+     * (VNEG at 0x08037166, documented in meter_math_pipeline_annotated.c since
+     * 2026-04 but never implemented here). Bench, @saulvalenzuela23 #37:
+     * -2.0030 V arrives as frame[2] = 0xB6 with frame[7] = 0x00, so the old
+     * rule below alone showed +2.003 V. frame[7] bit 0 is kept for DCV/DC
+     * current, where @Stlkv measured it on a -00.03 mA frame (EXP-205 5c). */
+    r->negative = ((frame[2] & 0x10U) != 0U) ||
+                  ((submode == 0 || submode == 2 || submode == 3) &&
                    (status & (1 << 0)) != 0);
 
     /* Parse flags from byte [6] */
@@ -1413,8 +1567,11 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
         return;
     }
 
-    /* Overload: "OL" */
-    if (digit0 == 0x0A && digit1 == 0x0B) {
+    /* Overload: "OL", and the SoC's other spelling " 0L " (blank, 0, L,
+     * blank) -- what resistance shows on open probes, continuity above its
+     * threshold and diode above its range (units #1 and #2). */
+    if ((digit0 == 0x0A && digit1 == 0x0B) ||
+        (digit0 == 0x10 && digit1 == 0x00 && digit2 == 0x0E && digit3 == 0x10)) {
         meter_clear_payload(r);
         r->result_class = METER_RESULT_OVERLOAD;
         strcpy(r->display_str, "OL");
@@ -1473,7 +1630,7 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
         return;
     }
 
-    if (!raw_digits_are_all_bcd(r->dbg_raw_digits)) {
+    if (!raw_digits_are_all_bcd(text_codes)) {
         /*
          * The segment lookup returns real digit values only for 0..9. Other
          * stock-visible codes represent OL glyphs, blanks, continuity icons,
@@ -1493,23 +1650,18 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
 
     /* --- Normal BCD value --- */
 
-    if (resistance_low_ohm_calibration_unresolved(submode, flags)) {
-        r->reject_reason = METER_REJECT_UNRESOLVED_CALIBRATION;
-        METER_REJECT_FRAME();
-        return;
-    }
-
     uint8_t d0 = digit0;
     uint8_t d1 = digit1;
     uint8_t d2 = digit2;
     uint8_t d3 = digit3;
 
-    if (submode != 0 && (frame[2] & 0x08U) != 0U) {
+    if (submode != 0 && submode != 6 && submode != 7 && (frame[2] & 0x08U) != 0U) {
         /*
-         * Stock only proves frame[2].3 as the raw +10000 extension in the DCV
-         * formatter/value path. Reusing that bit in other submodes creates a
-         * host-side mismatch where the 4-digit display keeps the old digits but
-         * the computed value silently jumps by +10000/divisor.
+         * frame[2].3 is the leading "1" of the 5-digit display (+10000 raw).
+         * Proven in DCV (stock formatter) and, since 2026-10-03, in resistance
+         * (@saulvalenzuela23 #37: 100.65 Ohm = 0xEC with digits "00.65"),
+         * where format_5digit() below shows it. Elsewhere it stays refused:
+         * a 4-digit display with a silent +10000 is the mismatch this guards.
          */
         r->reject_reason = METER_REJECT_UNSUPPORTED_EXTENSION;
         METER_REJECT_FRAME();
@@ -1529,6 +1681,13 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
 
     meter_stock_fsm_apply(submode, frame, raw_digit_codes);
     r->decimal_pos = decimal_pos_from_stock(submode, &meter_stock_fsm);
+    if (submode != 0) {
+        if (frame_dp) {
+            r->decimal_pos = frame_dp;          /* the SoC's own point */
+        } else if (text_numeric || submode == 6 || submode == 7) {
+            r->decimal_pos = 0;                 /* "  28", "2168": no point, an integer */
+        }
+    }
     r->unit_variant = meter_stock_fsm.variant;
     r->unit_suffix = unit_suffix_from_stock(submode, meter_stock_fsm.unit_index);
     (void)apply_stock_dcv_voltage_range_hint(r, submode, frame);
@@ -1544,59 +1703,97 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
     r->continuity_beep = false;
     format_reading(r, submode);
     (void)apply_stock_dcv_decimal_exponent(r, submode, frame);
+    if (submode != 0 && r->decimal_pos == 0) {
+        /* format_reading()'s divisor treats position 0 as four decimals and
+         * leaves DCV to the class path above; outside DCV, no point means the
+         * text is the integer it shows. */
+        r->value = (float)r->bcd_value;
+        if (r->negative) r->value = -r->value;
+    }
 
-    /* ── Resistance kOhm band unit normalization ──
+    /*
+     * Resistance and continuity: the SoC's text and its range bits, no
+     * per-unit coefficient (the 0.0304 low-ohm factor is withdrawn -- shorted
+     * probes read as " 0.17" on unit #2 and " 0.14" on unit #1, which is lead
+     * resistance, not 0.5 Ohm). Measured on both units, EXP-27 / EXP-205:
      *
-     * For resistance/continuity submodes, the FPGA meter IC rotates
-     * through multiple frame variants per measurement, each claiming
-     * a different dp/unit. The "correct" interpretation depends on
-     * which specific frame[6] we happen to catch — without override,
-     * the display flickers between e.g. "9.821 kOhm" and "98.24 kOhm"
-     * for the SAME 10 kΩ resistor.
+     *   frame[7] & 0x04           upper band: digits are hundreds of ohms and
+     *                             carry no point ("2978" -> 297.8 kOhm)
+     *   a point in the frame      the text as shown; frame[6] upper nibble 4
+     *                             is the kOhm regime ("9.924" -> 9.924 kOhm),
+     *                             otherwise ohms (" 0.17" -> 0.17 Ohm)
+     *   no point                  integer ohms; in the kOhm regime shown with
+     *                             three decimals ("2168" -> 2.168 kOhm)
      *
-     * Only the kOhm band is normalized here:
-     *
-     *   kOhm band (frame[6] upper nibble 4): value = bcd_value * 0.001 kOhm
-     *
-     * The low-Ohm band is rejected above until its factory calibration source is
-     * recovered. The 0.001 kOhm factor is a geometric identity (raw counts
-     * already expressed in Ohm, shifted to kOhm) and should be stable across
-     * units.
-     *
-     * Higher bands (MΩ, autorange to 200 kΩ / 2 MΩ) are not yet
-     * characterized — those will need additional upper-nibble cases.
-     *
-     * We leave bcd_value, decimal_pos, and digits[] untouched so the
-     * debug overlay at meter_ui.c:948 still shows the FPGA's raw
-     * pre-cal report. UI code reads `value` and `display_str` for
-     * the final numbers.
+     * The continuity submode reads the same text (" 0.17" on shorted probes,
+     * " 0L " above the SoC's threshold); whether a number there should also
+     * beep is display policy and is left as it was.
      */
     if (submode == 6 || submode == 7) {
-        float       scale = 0.0f;
-        const char *unit  = NULL;
+        char *s = r->display_str;
+        bool kohm_regime = (flags & 0xF0U) == 0x40U;
 
-        switch (flags & 0xF0) {
-        case 0x40:  scale = METER_KOHM_UNIT_FACTOR; unit = "kOhm"; break;
-        default:    break;  /* Unknown band — leave format_reading's output */
+        if (status & 0x04U) {
+            float kohm = (float)r->bcd_value * 0.1f;
+            r->value = kohm;
+            r->unit_suffix = "kOhm";
+            r->decimal_pos = 0;
+            format_4digit_unsigned(kohm, s);
+        } else if (r->bcd_value >= 10000 || (!frame_dp && (frame[8] & 0x80U))) {
+            /* The 5-digit display, read the way the SoC formats it:
+             *   - an explicit point in the digits wins;
+             *   - otherwise frame[8] bit 7 = the 2 kOhm range, four decimals
+             *     ("x.xxxx" kOhm);
+             *   - frame[2] bit 3 = the leading digit is 1.
+             * Settled 2026-10-05 on unit #1 against two reference meters:
+             * 220 Ohm sent 2203 + bit 7 (DMM 218.2 -> 0.2203 kOhm), 1 kOhm sent
+             * leading 1 + 0103 + bit 7 (DMM 1.005 k -> 1.0103 kOhm), and 2.2 k /
+             * 10 k sent explicit points with bit 7 clear. The 220 Ohm frame was
+             * PREDICTED before it was measured, from unit #2's "2.2 kOhm" fixture
+             * (2168 + bit 7), which was therefore a 220 Ohm part (216.8 Ohm).
+             * @saulvalenzuela23's 1 kOhm (9977 + bit 7 -> his meter showed
+             * 0.9977 kOhm) fits too. Before this, both cases read 10x high. */
+            uint8_t decimals = frame_dp ? (uint8_t)(4U - frame_dp)
+                             : (frame[8] & 0x80U) ? 4U : 0U;
+            format_5digit(r, decimals);
+            r->unit_suffix = kohm_regime ? "kOhm" : "Ohm";
+        } else if (frame_dp) {
+            r->unit_suffix = kohm_regime ? "kOhm" : "Ohm";
+        } else if (kohm_regime) {
+            float kohm = (float)r->bcd_value * METER_KOHM_UNIT_FACTOR;
+            r->value = kohm;
+            r->unit_suffix = "kOhm";
+            format_4digit_unsigned(kohm, s);
+        } else {
+            r->unit_suffix = "Ohm";
         }
-
-        if (scale != 0.0f) {
-            float v = (float)r->bcd_value * scale;
-            if (r->negative) v = -v;
-            r->value       = v;
-            r->unit_suffix = unit;
-
-            char *s = r->display_str;
-            int   pos = 0;
-            float av  = v;
-            if (av < 0.0f) { s[pos++] = '-'; av = -av; }
-            format_4digit_unsigned(av, s + pos);
-
-            /* Recompute bar graph fraction from the corrected value. */
-            float abs_v = v < 0.0f ? -v : v;
+        {
+            float abs_v = r->value < 0.0f ? -r->value : r->value;
             float full_scale = (submode < 11) ? bar_full_scale[submode] : 1000.0f;
             r->bar_fraction = abs_v / full_scale;
             if (r->bar_fraction > 1.0f) r->bar_fraction = 1.0f;
+        }
+    }
+
+    /*
+     * Capacitance: the frame describes itself (unit #2, EXP-205 and five
+     * capacitors on 2026-09-07). frame[7] == 0x10 marks the function; the
+     * unit is frame[6]'s upper nibble, 0x2_ nF and 0x1_ uF; the point is in
+     * the digits ("9.623" nF, "9.697" uF, "100.6" nF, "90.36" uF). The mF
+     * range was never on the bench, so any other nibble is refused rather
+     * than guessed. Synthetic frames without the 0x10 marker keep the stock
+     * formatter's default, which is what the older tests describe.
+     */
+    if (submode == 9 && status == 0x10U) {
+        uint8_t cap_unit = (uint8_t)(flags & 0xF0U);
+        if (cap_unit == 0x20U) {
+            r->unit_suffix = "nF";
+        } else if (cap_unit == 0x10U) {
+            r->unit_suffix = "uF";
+        } else {
+            r->reject_reason = METER_REJECT_UNSUPPORTED_EXTENSION;
+            METER_REJECT_FRAME();
+            return;
         }
     }
 
@@ -1621,4 +1818,14 @@ const char *meter_data_get_display_str(void)
 float meter_data_get_bar_fraction(void)
 {
     return meter_reading.bar_fraction;
+}
+
+bool meter_continuity_is_short(const meter_reading_t *r, float threshold_ohm)
+{
+    if (!r->valid) return false;
+    if (r->continuity_beep || r->result_class == METER_RESULT_CONTINUITY)
+        return true;
+    if (r->result_class != METER_RESULT_NORMAL) return false;
+    if (!r->unit_suffix || strcmp(r->unit_suffix, "Ohm") != 0) return false;
+    return r->value >= 0.0f && r->value < threshold_ohm;
 }

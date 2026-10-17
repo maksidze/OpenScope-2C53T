@@ -8,11 +8,22 @@
 
 The FNIRSI 2C53T is a capable $75 handheld 3-in-1 instrument held back by buggy stock firmware. This project is a complete clean-room firmware rewrite built from reverse engineering the original binary.
 
+> ### 🛑 This firmware is for the FNIRSI **2C53T** only
+>
+> **Do not flash it to a 2C23T, a 2C53P, or any other FNIRSI model.** The boards are close relatives but not interchangeable: different pin assignments, different FPGA transport, different application base address, and a different factory bootloader. Flashing this to the wrong model will not work and, if you follow Path B of [First-Time Hardware Setup](#first-time-hardware-setup), it will overwrite that device's factory bootloader with one built for the 2C53T. (Path A, the `guest` images, leaves the bootloader alone, but is still built for the 2C53T's hardware and not for any other model.)
+>
+> - **FNIRSI 2C23T** → use [rosenrot00/OpenScope-2C23T](https://github.com/rosenrot00/OpenScope-2C23T), which is written for that hardware.
+> - **Anything else** → there is no open firmware for it yet. Please don't experiment with this one.
+>
+> Check the model printed on the back of your unit before you start. If you have already flashed the wrong device, open an issue — the AT32's ROM DFU mode is unerasable mask ROM, so recovery is almost always possible.
+
 > **🎉 The oscilloscope captures.** As of **2026-08-13**, the `make guest-coldtrace` build cold-boots, configures the Gowin GW1N-UV2 FPGA itself, arms the capture engine, and renders live, probe-responsive waveforms — no stock firmware, no warm handoff, no opening the case. The FPGA configuration problem that owned this project's critical path from April to August is **solved**. [How to see it](#seeing-live-waveforms-today) · [the story](docs/devlog/2026-08-13-cold-boot-to-scope.md) · [issue #18](https://github.com/DavidClawson/OpenScope-2C53T/issues/18)
 
 > ### ⚠️ This is development firmware — don't depend on it for real measurements
 >
-> **The scope captures, but it is not yet a *usable* instrument.** There is **no timebase control** — each hardware sweep is a ~microsecond, 1024-sample snapshot refreshed about 34 times a second, so the trace faithfully tracks slow signals as a moving level and anything above roughly 15 Hz aliases into nonsense. **Vertical calibration is a placeholder** — the baseline sits around 55 and the trace clips against the top of the plot. And the **measurement badges on the scope screen are hardcoded strings, not measurements** — they will show `1.00kHz` / `707mV` / `50.0%` no matter what you probe. It is a real oscilloscope with a vertical axis and no horizontal knob. If you need a working scope today, stay on stock.
+> **Back up your factory calibration before your first flash.** Every unit carries its own calibration in one 4 KB page of MCU flash (`0x08006000`), and OpenScope images overwrite it. Nothing we hold can regenerate it ([#28](https://github.com/DavidClawson/OpenScope-2C53T/issues/28)). It is a one-time step of a few minutes, and it cannot be done after the fact: [how](#back-up-your-factory-calibration-first).
+>
+> **The scope captures, and both axes now carry measured numbers — but it is validated on one physical unit.** Timebase control reaches the hardware and 8 of 21 rate codes are bench-measured; the rest display `--` rather than a guess. Vertical ranges 5/6/7 are measured and cross-validated four ways, 4/8/9 are provisional and marked `~`, and 0–3 rail and fall back to honest ADC counts. The measurement badges are real measurements, not placeholders. What is *not* settled: **absolute vertical scale** traces to a bench source never checked against a reference (the error is uniform and recoverable with one constant), the **vertical graticule autoscales by default** so a division does not mean the printed volts/div, **CH2 has one usable attenuator tap**, and the acquisition record carries stale data at its edges. If you need a scope you can trust unsupervised today, stay on stock.
 >
 > **The multimeter works, but treat it as unverified on your unit.** The decode is accurate within a few percent on our bench device, but the low-Ω calibration factor is *per-device* and currently hardcoded to that one unit — so absolute readings on your hardware have not been checked by anyone. **Use it alongside a known-good meter**, the way you would with any unfamiliar instrument, and don't trust it alone for anything that matters.
 >
@@ -20,9 +31,19 @@ The FNIRSI 2C53T is a capable $75 handheld 3-in-1 instrument held back by buggy 
 
 ## Current Status
 
-**Custom firmware runs on real hardware, and it captures.** On 2026-08-13, bench unit #1 powered on into this firmware, configured the FPGA over SSPI (status `0x00039020` → `0x0003F460`, `DONE_FINAL` set), armed the capture engine, and drew live traces from real ADC data on both channels — reproducibly across power cycles. Both axes now carry measured numbers: per-range volts/div on both channels (2026-08-18) and eight measured sample rates on the timebase ladder (2026-08-19), each cross-checked against an independent rig. Active development has moved to **wiring the layer above acquisition** — the FFT, math and measurement code that is written and tested but still fed synthetic input.
+**Custom firmware runs on real hardware, and it captures.** On 2026-08-13, bench unit #1 powered on into this firmware, configured the FPGA over SSPI (status `0x00039020` → `0x0003F460`, `DONE_FINAL` set), armed the capture engine, and drew live traces from real ADC data on both channels — reproducibly across power cycles. Both axes now carry measured numbers: per-range volts/div on both channels (2026-08-18) and eight measured sample rates on the timebase ladder (2026-08-19), each cross-checked against an independent rig. Active development has moved to **wiring the layer above acquisition**: as of v0.4.0 (2026-09-30) triggering is fully usable from the buttons, captures are time-ordered with the trigger mid-record, and the FFT analyses live data; v0.4.1 (2026-10-05) adds waveform pass/fail masks, fixes four scope controls that only changed their label, and ships a meter image checked against reference meters. The measurement badges and the FFT read from real captures; math channels and protocol decoders are still written, host-tested, and fed synthetic input.
+
+### What it looks like
+
+Captured from bench unit #1 running v0.4.0, over USB with `scripts/screenshot.py`. These are the device's own framebuffer, not mock-ups; colours are rounded to the firmware's 16-colour screenshot palette.
+
+| Scope, SINGLE: CH1 sine, CH2 square, trigger at mid-screen | FFT on the live capture | Multimeter, DC volts |
+|---|---|---|
+| ![Scope time view](docs/screenshots/scope-time-single.png) | ![FFT view](docs/screenshots/fft-live.png) | ![Meter reading 1.6141 V](docs/screenshots/meter-dcv.png) |
 
 ### Seeing live waveforms today
+
+> **Before the first flash, back up your factory calibration** — [how](#back-up-your-factory-calibration-first). The image below overwrites the page that holds it, and a copy cannot be made afterwards.
 
 Live capture lives in **one specific build target**. `make` and `make guest` do *not* configure the FPGA and will *not* capture — only `guest-coldtrace` runs the configuration path:
 
@@ -31,12 +52,12 @@ cd firmware && make guest-coldtrace
 python3 ../scripts/iap_flash.py     # MENU + tap Power → upgrade mode → detect → flash
 ```
 
-`guest-coldtrace` is a **guest image**: it links at `0x08007000` and runs under the FNIRSI *stock* IAP bootloader (the `MENU + Power` upgrade mode described [below](#restoring-stock-or-flashing-via-usb-c-macos--linux)), rather than under our HID bootloader. It still needs the one-time 224KB SRAM option byte from [First-Time Hardware Setup](#first-time-hardware-setup). Power-cycle the device, open scope mode, and probe something slow (a few Hz). The firmware ships a synthetic demo square wave as a fallback — **when the demo trace disappears, you are looking at real samples.**
+`guest-coldtrace` is a **guest image**: it links at `0x08007000` and runs under the FNIRSI *stock* IAP bootloader (the `MENU + Power` upgrade mode described [below](#restoring-stock-or-flashing-via-usb-c-macos--linux)), rather than under our HID bootloader. It flashes with the case closed and never touches the factory bootloader. The 224 KB SRAM option byte it needs is already set on any unit that has ever booted FNIRSI's own firmware, so ROM DFU is not needed in the usual case — see Path A in [First-Time Hardware Setup](#first-time-hardware-setup). Power-cycle the device, open scope mode, and probe something slow (a few Hz). The firmware ships a synthetic demo square wave as a fallback — **when the demo trace disappears, you are looking at real samples.**
 
 Three caveats, stated plainly:
 
-- It is a **scope-only experimental image**. It holds USART2 dark, which is what the multimeter runs on, so the meter is inactive in this build.
-- It is validated on **one physical unit**. Nobody has run it on a second 2C53T.
+- The **multimeter in this image reads DC Voltage only**, alongside the scope (EXP-23). It runs the meter chip's own auto mode. The fix for the other functions — [@Stlkv](https://github.com/Stlkv)'s corrected command header and display decoder ([#33](https://github.com/DavidClawson/OpenScope-2C53T/pull/33), [#35](https://github.com/DavidClawson/OpenScope-2C53T/pull/35)) — builds as `guest-coldtrace-meter`, tested on his unit, and becomes the default once validated on ours.
+- v0.4.0 has run on **three units across both known board revisions**: bench unit #1 and [@mquerostudio](https://github.com/mquerostudio)'s unit #3 (both V1.4), and [@saulvalenzuela23](https://github.com/saulvalenzuela23)'s early unlabelled board ([#37](https://github.com/DavidClawson/OpenScope-2C53T/issues/37)). Bench unit #2 is [@Stlkv](https://github.com/Stlkv)'s V1.4, which ran development builds.
 - **It is not the default `make guest` boot path yet.** Folding it in is on the roadmap.
 
 ### Working on hardware today
@@ -45,6 +66,9 @@ The short version; see [Feature maturity](#feature-maturity) below for how far e
 
 - **Live oscilloscope capture from a cold boot** (`guest-coldtrace` only) — MCU-driven FPGA configuration, engine arm, and per-channel `0x04`/`0x05` readout
 - **Measured volts/div and time/div**, with uncalibrated ranges labelled `--` rather than guessed
+- **Triggering from the buttons**: AUTO/NORMAL/SINGLE, level, Rising/Falling, and horizontal position with pre-trigger capture (v0.4.0)
+- **FFT and waterfall on the live capture**
+- **Waveform pass/fail masks** — teach from good captures, judge every later one, stop on a failure (v0.4.1)
 - 4 navigable UI modes: oscilloscope, multimeter, signal generator, settings
 - 4 color themes, variable-width bitmap fonts at 4 sizes
 - FreeRTOS with display + input tasks; 15/15 button matrix at 500 Hz
@@ -75,33 +99,35 @@ reviewable promotion-ladder spec per feature.
 | Feature | Stage | Where it actually stands |
 |---|---|---|
 | Cold-boot FPGA configuration | **S2** | Bit-banged SSPI only. The same bytes through the SPI3 peripheral are still silently discarded. |
-| Live capture, CH1 | **S2** | Reproducible across power cycles on one unit. |
-| Live capture, CH2 | **S1** | One usable attenuator tap; every other code parks at a fixed level. Its vertical offset reference (TMR13 CH1 PWM on PA6) has never been programmed, which is the leading explanation. |
+| Live capture, CH1 | **S2** | Reproducible across power cycles on bench unit #1; v0.4.0 also captures live on unit #3 (V1.4) and on the unlabelled early board. |
+| Live capture, CH2 | **S2** | Armed at boot in `guest-coldtrace` (EXP-38): a fresh boot reads CH2's own tone beside CH1's, no shell command. The CH2 attenuator ladder has not been re-measured since arming. |
 | Vertical scale (volts/div) | **S3** | Ranges 5/6/7 measured and cross-validated four ways; 4/8/9 provisional and marked `~`; 0–3 rail and return `0.0`, with callers falling back to ADC counts. **Absolute scale is unverified** — every gain traces to an amplitude commanded from an unchecked source. One constant fixes it when a trusted source arrives. |
 | Horizontal scale (time/div) | **S3** | 8 of 21 timebase codes measured; the rest show `--` rather than a guess. The UI button reaches the FPGA as of 2026-08-19 — before that it moved a label and nothing else. |
 | Freq badge | **S3** | Spectral, with a held-out fixture and a bin-stratified assertion. Refuses on torn records instead of guessing; answers ~87% of bench captures and has never been wrong on them. |
 | Vpp / Vrms / Period badges | **S2** | Bench-validated against a commanded sine, 3 ranges × 2 codes (EXP-19, 2026-08-20): Vrms within 3.8%, frequency-derived Period within 0.2%, Vpp within 7% with a small residual positive bias (peak detection reads high on a noisy record even after percentile trimming — Vrms is the number to trust). Same-source circularity means this is pipeline+linearity, not absolute volts. Duty passed its host battery but has not faced a commanded duty cycle yet. |
-| Trigger level | **S1** | Digital, SPI3 register `0x08`, an ADC code. Re-armed at boot. |
+| Trigger level | **S2** | Digital, SPI3 register `0x08`. The comparator fires at code − 28 on ranges 5 and 7 alike (EXP-56). Set from the device: **MOVE** hands **UP/DOWN** to the level, and the marker sits where the hardware fires (bench-checked on unit #1). |
+| Trigger modes, edge, position | **S2** | AUTO / NORMAL / SINGLE, Rising / Falling (a firmware filter — the FPGA fires on both edges, EXP-55), and horizontal position (**MOVE** twice, **LEFT/RIGHT**; trigger at mid-screen by default). Captures are time-ordered with the trigger in the middle. Guarded by `scripts/exp22_stability.py --trigger-only`, 21 scenarios with negative controls. |
 | Settings persistence | **S2** | Commissioned on hardware 2026-08-20: first record ever written to the W25Q, then restored — and pushed into the FPGA — across three consecutive power cycles. Until that day every write was refused by a build-time interlock (`SETTINGS_PERSIST_WRITES=0`) no bench build had ever enabled, so this row previously said "real" while zero records existed — the matrix's first *over*statement. **Documented gap** (still true): a change carries only if a later button press or an orderly power-off follows it. |
-| Multimeter | **S1** | Works, and is accurate within a few percent on DCV and resistance — but **not in `guest-coldtrace`**, which holds USART2 dark. The two do not currently coexist. |
+| Multimeter | **S1** | In `guest-coldtrace` (the release image) the meter runs its own auto mode and reads **DC volts** alongside the scope; other functions do nothing yet. The command-header fix and the display decoder (@Stlkv, #33/#35) drive all functions in `guest-coldtrace-meter`, tested on a second unit, not yet on ours. |
 | Signal generator | **S1** | Reachable; output has never been characterised against an instrument. |
-| Screenshot capture (BMP) | **S1** | Has a call site and writes to flash. |
-| Rendering path | **S1** | Flicker-free column compositor with a redraw gate. The scope trace **autoscales** to fill the band, so the vertical graticule does not currently mean the volts/div the status bar prints. |
-| FFT spectrum + waterfall | **S0** | Fed a synthetic 1 kHz square wave generated on the spot. |
+| Screenshot capture (BMP) | **S0** | **Corrected 2026-10-03 — this row said S1, "has a call site and writes to flash"; neither was true.** `src/util/screenshot.c` has no caller and nothing writes the stock FAT volume. SAVE printed `SAVED #n` and saved nothing; it now says `SAVE: not in this build`. Screenshots work over USB: `scripts/screenshot.py` (CRC-verified, needs a held screen). |
+| Rendering path | **S3** | Flicker-free column compositor with a redraw gate. Display stability is bench-measured through the real render path (EXP-22, 2026-09-03): both channels driven, amplitude/frequency/phase varied, 11/11 scenarios lock to ≤1 px, with an on-hardware negative control that correctly fails. The scope trace **autoscales** to fill the band, so the vertical graticule does not currently mean the volts/div the status bar prints — that is the remaining S4 item. |
+| FFT spectrum + waterfall | **S2** | Analyses the live capture (2026-09-22): peak bins exact at three measured timebases, header in Hz on measured codes and refused elsewhere, labels legible on the screen. Whole-record input is time-ordered since v0.4.0. |
 | Math channels | **S0** | Fed a hardcoded sine LUT and square wave. |
 | Bode plot | **S0** | A generated demo response of a first-order low-pass. |
 | Protocol decoders (UART/SPI/I2C/CAN/K-Line) | **S0** | No call sites. |
 | Auto-measurements engine (`measurement_compute`) | **S0** | Still has no caller — superseded by `scope_measure.c`, which drives the badges above. Its one unique quantity (rise/fall time) is unwired; the rest is scheduled for deletion (see the spec). |
-| XY / roll / trend / mask testing | **S0** | No call sites. |
+| Waveform pass/fail (mask) | **S3** | Taught from N captures, aligned on the hardware trigger, refuses records it cannot compare. On unit #1 (EXP-69, twice): 0 false fails in ~40 records; +30% amplitude and +5% frequency failed every record; a trigger-level change was refused rather than scored; stop-on-fail holds the failing capture with its failing columns in red. From the buttons: **AUTO** teaches / clears, **MOVE** → *Mask* sets tolerances and stop-on-fail, **OK** resumes after a held failure; bounds are drawn on the trace. Guarded by `scripts/bench_regression.py` ([spec](docs/specs/scope/mask-pass-fail.md)). |
+| XY / roll / trend | **S0** | No call sites. |
 | `modules/` | **S0** | 17 guided-procedure files across four trades, with a provisional schema ([`modules/README.md`](modules/README.md)) — but no loader: nothing in the firmware reads them. |
 
 ### Sharp edges — read before trusting the screen
 
-- **The vertical graticule is not the volts/div label.** The renderer autoscales every frame from the buffer's own min/max, a deliberate choice from when we had no measured gains and no offset control. The volts/div in the status bar is now genuinely measured, so the two disagree. Reconciling them is queued.
+- **v0.4.0 and earlier: SAVE in scope mode silently changes CH1's input path, and the coupling buttons change only the label.** SAVE toggled the PC12 relay (direct vs ~30× attenuated, normally set by the range), leaving volts/div wrong until the next range change. CH1/CH2's DC/AC/GND cycled a label while the AC/DC relays stayed DC. Fixed in v0.4.1: SAVE does nothing and says so, coupling drives the relays with readback (GND removed, since no ground path is known), the probe setting scales the readouts and the 20M limit says `n/a` (EXP-70). If you are still on v0.4.0, don't press SAVE in scope mode, and treat the coupling label as "always DC".
+- **By default the vertical graticule is not the volts/div label.** The renderer autoscales every frame from the buffer's own min/max, a deliberate choice from when we had no measured gains and no offset control. The volts/div in the status bar is now genuinely measured, so the two disagree. An opt-in true-scale path (`fpga scope graticule true`) draws at a fixed counts/division so one division means the printed volts/div on calibrated ranges — default off (it needs a centred baseline) and not yet eyeballed on the bench.
 - **Absolute vertical scale is uncalibrated.** All gains are relative to a bench source that has never been checked against a reference. Any error is uniform and recoverable with one constant.
 - **Only the bit-banged configuration path works.** Stock configures the same part over hardware SPI, so this is an unexplained gap, not a property of the peripheral.
 - **The USB CDC debug shell does not enumerate on every build.** It correlates exactly with which configuration path the image uses; the mechanism is unestablished. It is a diagnostic channel, not a user feature.
-- **The FFT waterfall repaints by issuing one fill per pixel column** — 20,480 draw calls per frame — and visibly rasters.
 
 The story of how we got here — including the six weeks lost to a mis-clocked register read, and the several confident hypotheses that turned out to be wrong — is in the [devlog](docs/devlog/).
 
@@ -120,6 +146,34 @@ The story of how we got here — including the six weeks lost to a mis-clocked r
 > The MCU markings are sanded off. We identified it as AT32F403A through register probing — it's register-compatible with GD32/STM32F1 at the GPIO level.
 
 ## Getting Started
+
+### Back up your factory calibration first
+
+Do this once per unit, before the first OpenScope flash. It cannot be done afterwards.
+
+Each 2C53T carries its own calibration in one 4 KB page of MCU flash, `0x08006000`–`0x08006FFF`. The values are per unit: 127 of the 256 calibration bytes differ between a pristine V1.4 unit and bench unit #1, and the three units compared in [`archive/factory_cal/`](archive/factory_cal/README.md) differ pairwise across the whole block ([#28](https://github.com/DavidClawson/OpenScope-2C53T/issues/28)). No firmware we hold computes the values, so a page that is lost has nothing to be restored from. The v0.4.0 release notes state that OpenScope images overwrite it.
+
+Two kinds of backup, and only one of them restores:
+
+| What you keep | Can you write it back? |
+|---|---|
+| Photos of the LCD and the CRC32 that the release `caldump` image shows | No. The CRC32 lets you check that a restored page matches; the photos are a record. |
+| A 4096-byte dump of the page ([PR #41](https://github.com/DavidClawson/OpenScope-2C53T/pull/41): `caldump`, then `mem read 0x08006000 1024` over the shell; the `mem read` command itself is already on `main` and prints 32-bit words as hex text, which you convert to a 4096-byte binary file) | Yes, byte for byte, with the ROM DFU command below. |
+
+Steps, before you flash anything else:
+
+1. Enter upgrade mode: **MENU + tap Power**. The unit mounts a drive named `IAP`.
+2. Flash the release asset `openscope-2c53t-v0.4.1-caldump.bin` (or the v0.4.0 one; they read the page identically) (`python3 scripts/iap_flash.py flash <path>`, or drag it onto the `IAP` drive on Windows). It is read-only: it writes nothing, it only reports the page.
+3. The unit reboots into it. Photograph the screen and write down the CRC32. If you can run PR #41's `caldump` and `mem read 0x08006000 1024`, save the 4096 bytes too — that is the copy you can restore from.
+4. Re-enter upgrade mode and flash the scope image.
+
+To put your own page back later, enter ROM DFU (open case, BOOT0 + pinhole reset; see the [DFU Mode Guide](docs/dfu_mode_guide.md)) and run:
+
+```bash
+dfu-util -a 0 -d 2e3c:df11 -s 0x08006000 -D <your-caldump.bin>
+```
+
+where `<your-caldump.bin>` is the 4096-byte file from step 3. The recovery recipe in the DFU guide needs this step: the archived factory bootloader carries unit #1's page and overwrites yours ([#38](https://github.com/DavidClawson/OpenScope-2C53T/issues/38)).
 
 ### Prerequisites
 
@@ -162,9 +216,27 @@ This populates `firmware/build/` with `firmware.bin` (the application) and `opti
 
 ### First-Time Hardware Setup
 
-The first flash requires opening the case to enter the AT32's **ROM DFU mode** — this is the only mode that can write option bytes. After the initial flash installs the USB HID bootloader, all future updates go over USB-C with the case closed.
+There are two ways in. They differ in whether you open the case and in what happens to the factory bootloader at `0x08000000`. Back up your calibration first either way ([above](#back-up-your-factory-calibration-first)).
 
-> **Two bootloaders — don't confuse them.** *ROM DFU* (entered via BOOT0 + pinhole reset, LCD dark, `2e3c:df11`) is required for the one-time EOPB0 setup. The *USB HID bootloader* (Settings → Firmware Update, or POWER+PRM during reset, "BOOTLOADER MODE" on the LCD) handles every update after that but cannot write option bytes.
+#### Path A: a guest image through the factory IAP (default; case closed; nothing erased)
+
+`make guest-coldtrace` and the release's `*-coldtrace.bin` link at `0x08007000` and run under FNIRSI's own bootloader. Hold **MENU + tap Power**, the unit mounts the `IAP` drive, and `scripts/iap_flash.py` writes the image ([Restoring Stock or Flashing via USB-C](#restoring-stock-or-flashing-via-usb-c-macos--linux)). The factory bootloader is never touched, so MENU + Power keeps working, and no step on this path can wipe it.
+
+**You do not need ROM DFU if the unit has ever run FNIRSI's firmware.** The stock app sets EOPB0 = `0xFE` (224 KB SRAM) itself on its first boot (disassembly: [`stock_iap_bootloader.md`](reverse_engineering/analysis_v120/stock_iap_bootloader.md) §5A, guard at `0x1FFFF810`), and it cannot run in 96 KB mode: its initial stack pointer is `0x20036F90`. A unit that has ever booted stock therefore already has the byte. Checked on a pristine V1.4 (unit #3): the v0.4.0 `caldump` and `coldtrace` images booted through the IAP drive with no DFU step.
+
+To check your unit, flash the guest image. If it comes up, the unit is in 224 KB mode and you are done. A 96 KB unit should not get that far (not observed): the guest images put the stack at `0x20037FE0`, above the 96 KB ceiling at `0x20018000`. On builds where the shell enumerates, `version` prints `SRAM: 224KB (EOPB0=0xFE)`. Be aware that this line is a fixed string in the firmware (`firmware/src/drivers/usb_debug.c`), not a read of the option byte, so it tells you the image is running and nothing more.
+
+ROM DFU is needed only for a unit that has never booted FNIRSI's firmware and still has the 96 KB default. If it still has the stock image, power it up into stock once and let it reach the scope screen. The disassembly says the stock app sets the byte on that boot; this has not been observed on a unit that was in 96 KB mode. If there is no stock image to boot, step 5 of Path B is the fix, with the warning that goes with it. Note that the `caldump` image is a guest image too and will not run on such a unit either, so the calibration backup above is not possible there and there is no verified way to take it. Ask in an issue before step 5.
+
+Use the `IAP` drive for the first flash. The USB-staged `fwapply` installer is safe **from v0.4.1 on** (#45: it can no longer call into flash, and `scripts/test_ramfunc_isolated.py --check-bin` proves it per image; a staged install completed on unit #1 on 2026-10-05). The **v0.4.0** build of that installer hangs ([#42](https://github.com/DavidClawson/OpenScope-2C53T/issues/42), EXP-57/EXP-59): never `fwapply` *from* a unit running v0.4.0.
+
+#### Path B: OpenScope's HID bootloader through ROM DFU (case open)
+
+Choose this only if you want our USB HID bootloader (`make flash`, Settings → Firmware Update) in place of FNIRSI's. It needs the case open and the AT32's **ROM DFU mode**, and `make flash-all` replaces the factory bootloader. After the first flash, all later updates go over USB-C with the case closed.
+
+> **The option-byte write (step 5 below) is the dangerous step.** The blob also writes FAP = `0xA5`, i.e. read protection off (layout comment above `option_bytes48.bin` in `firmware/Makefile`), which is more than the SRAM size. Changing read protection is the operation on this MCU that can erase internal flash wholesale, and a failed option-byte write (`SET_ADDRESS not correctly executed`) leads to the `:unprotect:force` recovery in the [DFU guide's troubleshooting](docs/dfu_mode_guide.md#troubleshooting), which does erase all of it: factory IAP bootloader and calibration page included. Back up the calibration first. Path B with step 5 skipped, on a unit that already has the 224 KB byte, has not been tested, so do not assume `make flash-all` works without it.
+
+> **Two bootloaders — don't confuse them.** *ROM DFU* (entered via BOOT0 + pinhole reset, LCD dark, `2e3c:df11`) is the only mode that can write option bytes. You need it for Path B, and for the one-time EOPB0 setup on a unit that has never run stock. The *USB HID bootloader* (Settings → Firmware Update, or POWER+PRM during reset, "BOOTLOADER MODE" on the LCD) handles every update after that but cannot write option bytes.
 
 **See the full walkthrough with photos: [DFU Mode Guide](docs/dfu_mode_guide.md)**
 
@@ -176,7 +248,9 @@ The short version:
 2. Use a jumper wire to bridge 3.3V (from the SWD header near USB-C) to the BOOT0 pull-down resistor (MCU side, near the main chip)
 3. While holding 3.3V on BOOT0, press the pinhole reset button, then release both
 4. Verify ROM DFU: `dfu-util -l` should list `2e3c:df11` with alt interfaces 0 (Internal Flash) and 1 (Option Byte)
-5. Set EOPB0 = 0xFE → 224KB SRAM mode (one-time):
+> **⚠ Step 6 is the irreversible-feeling one.** `make flash-all` writes our bootloader over flash address `0x08000000`, replacing the FNIRSI factory IAP bootloader. Before you run it, confirm one last time that the device is a **2C53T** — this is the step that removes a wrong-model device's way back. Everything before it is recoverable by simply not continuing. If you want to keep the stock bootloader entirely, use Path A, the [MENU + Power channel](#restoring-stock-or-flashing-via-usb-c-macos--linux) with a `guest` build, which never touches `0x08000000`.
+
+5. Set EOPB0 = 0xFE → 224KB SRAM mode (one-time; the byte is already set on a unit that has run stock, but skipping this step is untested, and it also writes FAP — see the warning above):
    ```bash
    cd firmware
    dfu-util -a 1 -d 2e3c:df11 -s 0x1FFFF800 -D build/option_bytes48.bin
@@ -222,6 +296,8 @@ It auto-detects the device and available images, verifies the stock firmware by 
 
 **Windows** users can skip the tool — drag-drop the `.bin` onto the `IAP` drive (the official FNIRSI method; Windows' FAT driver handles the volume cleanly).
 
+If the factory bootloader itself is gone (MENU + Power no longer mounts `IAP`), the way back is the [full factory restore](docs/dfu_mode_guide.md#full-factory-restore-recover-menupower-upgrade-mode). Read its calibration warning first ([#38](https://github.com/DavidClawson/OpenScope-2C53T/issues/38)).
+
 ### Build
 
 ```bash
@@ -252,7 +328,7 @@ firmware/               Custom replacement firmware (C + FreeRTOS + Make)
   src/ui/               Scope, meter, siggen, settings, themes
   src/dsp/              FFT, math channels, signal gen, Bode
   src/decode/           Protocol decoders (UART, SPI, I2C, CAN, K-Line)
-  src/tasks/            Measurement engine, component tester, mask test
+  src/tasks/            Measurement engine, component tester
   bootloader/           USB HID IAP bootloader (16KB)
 
 reverse_engineering/    Hardware analysis and protocol documentation
@@ -307,7 +383,7 @@ The old ask here said netlist analysis showed **no sample-rate register in the F
 Every vertical gain in this firmware traces to an amplitude *commanded* from a bench generator that has never been checked against a reference, and we found out the hard way that the same generator was delivering 0.825× its commanded **frequency**. The relative numbers are cross-validated and solid; the absolute scale is one unknown constant. If you have a 2C53T and a calibrated source, a handful of known amplitudes at known frequencies would close it — `python3 scripts/verify_scope_cal.py` exists to consume exactly that.
 
 ### 4. Board variant documentation
-We've confirmed one board revision (V1.4) and one user has reported a different layout with no version marking. If your 2C53T looks different from [our photos](docs/images/), photos of your PCB (top and bottom) are extremely valuable — especially near the FPGA, SPI flash, and analog frontend.
+We know of two board revisions: V1.4, and an earlier unlabelled board documented in detail by [@saulvalenzuela23](https://github.com/saulvalenzuela23). Both revisions are now confirmed to run `guest-coldtrace` and capture live traces. See [docs/board_revisions.md](docs/board_revisions.md) for full hardware inventories and architecture differences. If your 2C53T looks different from [our photos](docs/images/), photos of your PCB are extremely valuable — especially near the FPGA, SPI flash, and analog frontend.
 
 ### 5. Everything else
 - **Test on your hardware** — different units reveal things a single bench unit can't

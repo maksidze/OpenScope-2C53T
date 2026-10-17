@@ -111,6 +111,44 @@ static void broken_no_hysteresis(const uint8_t *s, uint16_t n,
                         ? (float)(last - first) / (float)(rising - 1) : 0.0f;
 }
 
+/* Variant C: the pre-#26 period estimator — integer crossing indices, and the
+ * i==0 "rising edge" of a record that starts mid-high-phase counted as a
+ * period anchor. That spurious edge inflates (rising-1) and drags the period
+ * LOW, worst when few periods fit the window. This is the exact code that
+ * shipped before the sub-sample-crossing fix; it must visibly drift. */
+static void broken_integer_crossing(const uint8_t *s, uint16_t n,
+                                    scope_measure_t *o)
+{
+    scope_measure_record(s, n, o);
+    if (!o->valid || !o->level_valid) return;
+
+    uint16_t mid2  = (uint16_t)o->min + (uint16_t)o->max;
+    uint16_t hyst2 = (uint16_t)(o->pp / 4u);
+    if (hyst2 < 2u) hyst2 = 2u;
+    uint16_t hi_thr2 = (uint16_t)(mid2 + hyst2);
+    uint16_t lo_thr2 = (mid2 > hyst2) ? (uint16_t)(mid2 - hyst2) : 0u;
+
+    int state = 0;
+    uint16_t rising = 0, first = 0, last = 0;
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t s2 = (uint16_t)(2u * (uint16_t)s[i]);
+        if (state == 0) {
+            if (s2 >= hi_thr2) {
+                state = 1;
+                if (rising == 0) first = i;
+                last = i; rising++;
+            }
+        } else if (s2 <= lo_thr2) {
+            state = 0;
+        }
+    }
+    o->cycles = rising;
+    o->cycles_valid = (rising >= 2u);
+    o->period_valid = o->cycles_valid;
+    o->period_samples = o->cycles_valid
+                        ? (float)(last - first) / (float)(rising - 1u) : 0.0f;
+}
+
 /* ── Signal generators ────────────────────────────────────────────────── */
 
 static uint8_t clamp8(float v)
@@ -148,6 +186,18 @@ static void gen_sine(uint8_t *b, uint16_t n, uint16_t period,
 static void gen_const(uint8_t *b, uint16_t n, uint8_t v)
 {
     memset(b, v, n);
+}
+
+/* Sine with a NON-INTEGER period (samples/cycle) and a start phase, so the
+ * crossings fall between samples — the case an integer-index estimator gets
+ * wrong. phase = pi/2 starts the record at the peak, mid-high-phase. */
+static void gen_sine_f(uint8_t *b, uint16_t n, float period, float amp,
+                       float offset, float phase)
+{
+    for (uint16_t i = 0; i < n; i++) {
+        float v = offset + amp * sinf(2.0f * (float)M_PI * (float)i / period + phase);
+        b[i] = clamp8(v);
+    }
 }
 
 /* Apply the affine map an uncalibrated->calibrated vertical path would. */
@@ -277,6 +327,193 @@ static int battery(measure_fn f)
     return bad;
 }
 
+/*
+ * Period-bias sweep (issue #26). A fixed-period sine, recorded starting at the
+ * peak so the window opens mid-high-phase, at periods-per-window from ~40 down
+ * to ~5. The shipped estimator must stay within a tight bound at every count;
+ * the pre-fix integer estimator must drift LOW and worsen as periods thin out.
+ * If the control did not drift, the sweep would prove nothing.
+ */
+static int test_period_sweep(void)
+{
+    static uint8_t buf[N];
+    int bad = 0;
+
+    /* Non-integer so crossings never land on a sample (the integer case is the
+     * one that accidentally works). */
+    const float P[]  = { 25.6f, 34.13f, 51.2f, 102.4f, 170.67f, 204.8f };
+    const int   NP   = (int)(sizeof(P) / sizeof(P[0]));
+    float worst_real = 0.0f, worst_ctrl_few = 0.0f;
+
+    printf("period sweep (record starts high; true P vs recovered):\n");
+    for (int k = 0; k < NP; k++) {
+        gen_sine_f(buf, N, P[k], 90.0f, 128.0f, (float)M_PI * 0.5f);
+
+        scope_measure_t mr, mi;
+        scope_measure_record(buf, N, &mr);
+        broken_integer_crossing(buf, N, &mi);
+
+        float er = fabsf(mr.period_samples - P[k]) / P[k] * 100.0f;
+        float ei = fabsf(mi.period_samples - P[k]) / P[k] * 100.0f;
+        if (er > worst_real) worst_real = er;
+        if (P[k] >= 170.0f && ei > worst_ctrl_few) worst_ctrl_few = ei;
+
+        printf("   P=%7.2f (%2.0f/win): real %8.3f (%+.2f%%)   int %8.3f (%+.2f%%)\n",
+               (double)P[k], (double)(N / P[k]),
+               (double)mr.period_samples, (double)er,
+               (double)mi.period_samples, (double)ei);
+
+        char what[64];
+        snprintf(what, sizeof(what), "P=%.1f: real period within 0.5%%", (double)P[k]);
+        bad += chk(what, mr.period_valid && er < 0.5f);
+    }
+
+    /* Negative control: the pre-fix estimator has to drift, or the assertions
+     * above are testing nothing. At ~5-6 periods the spurious i==0 anchor costs
+     * ~1/K, i.e. several percent. */
+    bad += chk("integer estimator drifts >2% at ~5-6 periods (control)",
+               worst_ctrl_few > 2.0f);
+    printf("   worst real %.2f%%, worst integer @ few periods %.2f%%\n",
+           (double)worst_real, (double)worst_ctrl_few);
+    return bad;
+}
+
+/* Trapezoid with linear edges of KNOWN width, for the rise/fall pass (M4).
+ * One cycle: R-sample rise lo->hi, H hold at hi, F-sample fall hi->lo, rest at
+ * lo. A linear 0..R ramp crosses the 10% and 90% levels at 0.1R and 0.9R, so
+ * the 10->90 rise span is exactly 0.8R samples (and the fall 0.8F) — a
+ * closed-form target the pass must hit. */
+static void gen_trapezoid(uint8_t *b, uint16_t n, uint16_t period,
+                          uint16_t R, uint16_t H, uint16_t F,
+                          uint8_t lo, uint8_t hi)
+{
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t p = (uint16_t)(i % period);
+        float v;
+        if (p < R)                v = lo + (float)(hi - lo) * (float)p / (float)R;
+        else if (p < R + H)       v = hi;
+        else if (p < R + H + F)   v = hi - (float)(hi - lo) *
+                                        (float)(p - (R + H)) / (float)F;
+        else                      v = lo;
+        int iv = (int)(v + 0.5f);
+        if (iv < 0) iv = 0;
+        if (iv > 255) iv = 255;
+        b[i] = (uint8_t)iv;
+    }
+}
+
+/* rise/fall (M4): known widths, honest SAMPLES, and affine-invariant. */
+static int test_edge_timing(void)
+{
+    static uint8_t buf[N], buf2[N];
+    scope_measure_t m, m2;
+    int bad = 0;
+
+    const uint16_t R = 20, H = 30, F = 40;
+    gen_trapezoid(buf, N, 128, R, H, F, 40, 210);
+    scope_measure_record(buf, N, &m);
+
+    bad += chk("trapezoid: valid + level_valid", m.valid && m.level_valid);
+    bad += chk("rise time found", m.rise_valid);
+    bad += chk("fall time found", m.fall_valid);
+    bad += chk("rise ~ 0.8*R samples", near(m.rise_samples, 0.8f * R, 1.5f));
+    bad += chk("fall ~ 0.8*F samples", near(m.fall_samples, 0.8f * F, 1.5f));
+    if (g_verbose)
+        printf("      rise=%.2f (want %.1f)  fall=%.2f (want %.1f)\n",
+               (double)m.rise_samples, 0.8 * R,
+               (double)m.fall_samples, 0.8 * F);
+
+    /* Honest-units negative control: rise/fall are in SAMPLES, so an affine
+     * y = a*x + b (a > 0) on the samples must not change them — the same
+     * property that lets duty and period be shown before vertical cal exists.
+     * Halve the amplitude and lift it: the edges keep their sample widths. */
+    for (uint16_t i = 0; i < N; i++)
+        buf2[i] = (uint8_t)(buf[i] / 2 + 20);
+    scope_measure_record(buf2, N, &m2);
+    bad += chk("rise invariant under y=x/2+20",
+               m2.rise_valid && near(m2.rise_samples, m.rise_samples, 1.0f));
+    bad += chk("fall invariant under y=x/2+20",
+               m2.fall_valid && near(m2.fall_samples, m.fall_samples, 1.0f));
+
+    /* Silence: a flat record has no edges to time. */
+    gen_const(buf, N, 128);
+    scope_measure_record(buf, N, &m);
+    bad += chk("flat record: no rise/fall", !m.rise_valid && !m.fall_valid);
+
+    return bad;
+}
+
+/* Software display trigger (the "dancing trace" fix). The property that matters
+ * is phase-lock: two records of the same wave at different phase, each aligned
+ * to its own trigger, must overlay. Plus a hysteresis control — without it the
+ * trigger fires on threshold noise and the returned phase walks. */
+static int test_soft_trigger(void)
+{
+    int bad = 0;
+    uint8_t buf[N];
+
+    /* Clean sine about 128, starting at the midline heading DOWN (phase pi).
+     * First RISING crossing of 128 is half a period in (256/2 = 128). */
+    gen_sine_f(buf, N, 256.0f, 50.0f, 128.0f, (float)M_PI);
+    int idx = scope_measure_find_trigger(buf, N - 320, 128, true, 3);
+    bad += chk("rising: crossing found", idx > 0);
+    bad += chk("rising: near half period", idx >= 118 && idx <= 138);
+    if (idx > 0)
+        bad += chk("rising: really crosses up at idx",
+                   buf[idx] >= 128 && buf[idx - 1] < 128);
+
+    /* Falling edge on the same record fires almost immediately (starts at 128
+     * heading down). */
+    int idxf = scope_measure_find_trigger(buf, N - 320, 128, false, 3);
+    bad += chk("falling: crossing found", idxf >= 0);
+    if (idxf > 0)
+        bad += chk("falling: really crosses down at idx",
+                   buf[idxf] <= 128 && buf[idxf - 1] > 128);
+
+    /* No qualifying crossing -> -1 (level above the peak; and a flat record). */
+    bad += chk("level above peak -> -1",
+               scope_measure_find_trigger(buf, N - 320, 250, true, 3) == -1);
+    gen_const(buf, N, 128);
+    bad += chk("flat record -> -1",
+               scope_measure_find_trigger(buf, N - 320, 128, true, 3) == -1);
+
+    /* PHASE LOCK: same wave, two different start phases. After aligning each to
+     * its own trigger index, the windows must overlay sample-for-sample. */
+    uint8_t wa[N], wb[N];
+    gen_sine_f(wa, N, 200.0f, 50.0f, 128.0f, 0.0f);
+    gen_sine_f(wb, N, 200.0f, 50.0f, 128.0f, 1.3f);
+    int ia = scope_measure_find_trigger(wa, N - 320, 128, true, 3);
+    int ib = scope_measure_find_trigger(wb, N - 320, 128, true, 3);
+    bad += chk("phaselock: both trigger", ia > 0 && ib > 0);
+    if (ia > 0 && ib > 0) {
+        int maxd = 0;
+        for (int x = 0; x < 180; x++) {
+            int d = (int)wa[ia + x] - (int)wb[ib + x];
+            if (d < 0) d = -d;
+            if (d > maxd) maxd = d;
+        }
+        bad += chk("phaselock: aligned windows overlay (<=6)", maxd <= 6);
+    }
+
+    /* HYSTERESIS CONTROL: threshold noise (127/129 straddle) ahead of the real
+     * rising ramp. With hysteresis the trigger waits for the genuine edge in
+     * [50,90]; with hyst=0 it fires on the first straddle sample near index 1.
+     * If those two are NOT different, hysteresis is doing nothing and this test
+     * would pass a broken implementation. */
+    for (int i = 0; i < N; i++) {
+        if (i < 50)      buf[i] = (i & 1) ? 129 : 127;
+        else if (i < 91) buf[i] = (uint8_t)(110 + (i - 50)); /* ramp 110->150 */
+        else             buf[i] = 150;
+    }
+    int idx_h = scope_measure_find_trigger(buf, N - 320, 128, true, 3);
+    int idx_0 = scope_measure_find_trigger(buf, N - 320, 128, true, 0);
+    bad += chk("hyst: fires on real edge, not noise", idx_h >= 50 && idx_h <= 90);
+    bad += chk("hyst CONTROL: hyst=0 fires early on noise", idx_0 >= 0 && idx_0 < 10);
+    bad += chk("hyst CONTROL: the two differ", idx_h != idx_0);
+
+    return bad;
+}
+
 int main(int argc, char **argv)
 {
     g_verbose = (argc > 1 && strcmp(argv[1], "-v") == 0);
@@ -299,6 +536,24 @@ int main(int argc, char **argv)
     printf("   %d failed check(s) -> %s\n\n", b_bad,
            b_bad > 0 ? "control OK (test can fail)" : "*** CONTROL FAILED ***");
     if (b_bad == 0) fail = 1;
+
+    printf("period-bias sweep (issue #26)\n");
+    int sweep_bad = test_period_sweep();
+    printf("   %d failed check(s) -> %s\n\n", sweep_bad,
+           sweep_bad == 0 ? "PASS" : "*** FAIL ***");
+    if (sweep_bad) fail = 1;
+
+    printf("edge rise/fall timing (M4 — retires measurement.c)\n");
+    int edge_bad = test_edge_timing();
+    printf("   %d failed check(s) -> %s\n\n", edge_bad,
+           edge_bad == 0 ? "PASS" : "*** FAIL ***");
+    if (edge_bad) fail = 1;
+
+    printf("software display trigger (stop the free-run dancing)\n");
+    int trig_bad = test_soft_trigger();
+    printf("   %d failed check(s) -> %s\n\n", trig_bad,
+           trig_bad == 0 ? "PASS" : "*** FAIL ***");
+    if (trig_bad) fail = 1;
 
     printf(fail ? "RESULT: FAIL\n" : "RESULT: PASS\n");
     return fail;

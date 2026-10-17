@@ -45,6 +45,8 @@ C_SOURCES += src/drivers/lcd.c
 C_SOURCES += src/ui/status_bar.c
 C_SOURCES += src/ui/scope_ui.c
 C_SOURCES += src/ui/meter_ui.c
+C_SOURCES += src/ui/softkey.c
+C_SOURCES += src/ui/fuse_model.c
 C_SOURCES += src/ui/siggen_ui.c
 C_SOURCES += src/ui/settings_ui.c
 C_SOURCES += src/ui/component_ui.c
@@ -55,9 +57,9 @@ C_SOURCES += src/ui/scope_state.c
 C_SOURCES += src/ui/scope_measure.c
 C_SOURCES += src/ui/scope_cal.c
 C_SOURCES += src/ui/scope_timebase.c
+C_SOURCES += src/ui/scope_cursor.c
 C_SOURCES += src/ui/scope_freq.c
 C_SOURCES += src/tasks/input_handler.c
-C_SOURCES += src/tasks/measurement.c
 C_SOURCES += src/drivers/flash_fs.c
 C_SOURCES += src/drivers/flash_regions.c
 C_SOURCES += src/drivers/flash_regions_w25q.c
@@ -72,10 +74,12 @@ C_SOURCES += src/drivers/fpga_meter_plan.c
 C_SOURCES += src/drivers/fpga_scanner.c
 C_SOURCES += src/drivers/dac_output.c
 C_SOURCES += src/drivers/scope_trigger.c
+C_SOURCES += src/dsp/trig_edge.c
 C_SOURCES += src/drivers/meter_data.c
 C_SOURCES += src/drivers/meter_auto.c
 C_SOURCES += src/drivers/meter_autoselect.c
 C_SOURCES += src/drivers/usb_debug.c
+C_SOURCES += src/drivers/fw_loader.c
 C_SOURCES += src/drivers/rtt.c
 C_SOURCES += src/drivers/fault.c
 C_SOURCES += src/dsp/signal_gen.c
@@ -89,9 +93,12 @@ C_SOURCES += src/ui/meter_voltage_wave.c
 C_SOURCES += src/dsp/math_channel.c
 C_SOURCES += src/dsp/bode.c
 C_SOURCES += src/tasks/component_test.c
-C_SOURCES += src/tasks/mask_test.c
+C_SOURCES += src/dsp/mask_pf.c
+C_SOURCES += src/ui/scope_mask.c
 C_SOURCES += src/util/config.c
 C_SOURCES += src/util/cal_dump.c
+C_SOURCES += src/util/cal_backup_core.c
+C_SOURCES += src/util/cal_backup.c
 C_SOURCES += src/util/cal_reference.c
 C_SOURCES += src/util/settings_store.c
 C_SOURCES += src/util/screenshot.c
@@ -107,10 +114,13 @@ C_SOURCES += src/fonts/font_small.c
 C_SOURCES += src/fonts/font_medium.c
 C_SOURCES += src/fonts/font_large.c
 C_SOURCES += src/fonts/font_xlarge.c
+C_SOURCES += src/fonts/font_huge.c
+C_SOURCES += src/fonts/font_unit.c
 
 # FFT / DSP module
 ifneq ($(findstring FFT,$(FEATURES)),)
   C_SOURCES += src/dsp/fft.c
+  C_SOURCES += src/dsp/fft_live.c
   C_SOURCES += src/dsp/fft_test_signals.c
   FFT_DEFS = -DFEATURE_FFT
   # CMSIS-DSP (optional optimization — auto-detected)
@@ -385,11 +395,11 @@ guest: clean all
 # meter+CH2 both work  -> our bit-bang configuration is deficient, ONE root cause
 # neither works        -> our runtime code, not the configuration
 # split                -> two independent faults
-guest-warmtest-usart: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=0
+guest-warmtest-usart: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=0 -DFPGA_BENCH_SAVE_PC12=1
 guest-warmtest-usart: LDSCRIPT = ld/at32f403a_guest.ld
 guest-warmtest-usart: clean all
 
-guest-warmtest: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1
+guest-warmtest: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_BENCH_SAVE_PC12=1
 guest-warmtest: LDSCRIPT = ld/at32f403a_guest.ld
 guest-warmtest: clean all
 
@@ -403,7 +413,7 @@ guest-warmtest: clean all
 # CH2 trace appearing the way CH1 did after the DAC1 fix. See scope_trigger.c.
 # [LIVE] Queued bench item (dev plan F3): CH2 trigger reference via TMR13.
 #        Decoded, NOT yet confirmed on hardware.
-guest-warmtest-ch2: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CH2_TRIGGER=1
+guest-warmtest-ch2: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CH2_TRIGGER=1 -DFPGA_BENCH_SAVE_PC12=1
 guest-warmtest-ch2: LDSCRIPT = ld/at32f403a_guest.ld
 guest-warmtest-ch2: clean all
 
@@ -433,6 +443,36 @@ guest-usart-silent: clean all
 guest-bringup: CFLAGS += -DGUEST_BUILD -DFPGA_BUS_RELEASED_BOOT=1 -DFPGA_USART_SILENT_SCOPE=1
 guest-bringup: LDSCRIPT = ld/at32f403a_guest.ld
 guest-bringup: clean all
+
+# H7 step 1 (2026-08-26): guest-bringup PLUS FPGA_CONFIG_B so the bit-bang loader
+# is COMPILED (not run at boot — BUS_RELEASED_BOOT still takes the early-return
+# branch). Gives `fpga configbb` to fire bit-bang on demand and `fpga reinit` to
+# fire hardware-SPI on demand, from ONE build with identical off-SPI pin state —
+# the clean on-board A/B of bit-bang-success vs HW-SPI-failure. CDC stays up
+# (no config at boot). See docs/experiments/2026-08-26-31-*.
+guest-bringup-bb: CFLAGS += -DGUEST_BUILD -DFPGA_BUS_RELEASED_BOOT=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1
+guest-bringup-bb: LDSCRIPT = ld/at32f403a_guest.ld
+guest-bringup-bb: clean all
+
+# EXP-36 (2026-08-26): guest-bringup-bb with the bit-bang SCK SLOWED to ~470kHz
+# (FPGA_BB_HALF_DELAY=250) so `fpga configbb` clocks at AF's /256 rate. AF walls
+# at /2, /64 AND /256 (rate excluded for AF). If a slowed GPIO bit-bang STILL
+# configures, then at a MATCHED ~470kHz rate GPIO drive configures where AF drive
+# walls -> the differentiator is GPIO-vs-AF electrical drive, not rate. If it
+# fails, bit-bang's success is rate-dependent and the framing changes.
+guest-bringup-bb-slow: CFLAGS += -DGUEST_BUILD -DFPGA_BUS_RELEASED_BOOT=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_BB_HALF_DELAY=250
+guest-bringup-bb-slow: LDSCRIPT = ld/at32f403a_guest.ld
+guest-bringup-bb-slow: clean all
+
+# EXP-33 (2026-08-26): guest-bringup-bb but the on-demand `fpga configbb` uses
+# stock's EXACT bit-bang framing (WITH 0x05, 100ms gaps, no prelude reads,
+# immediate close) via FPGA_CONFIG_B_FAITHFUL. Forks "framing" vs "GPIO-vs-AF
+# electrical drive": if this still configures (port open->closed via spi3 gowin),
+# framing is excluded. FAITHFUL does not read cfg_status_reg — verdict is the
+# before/after anchor, not the configbb printout.
+guest-bringup-bb-faithful: CFLAGS += -DGUEST_BUILD -DFPGA_BUS_RELEASED_BOOT=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_FAITHFUL=1
+guest-bringup-bb-faithful: LDSCRIPT = ld/at32f403a_guest.ld
+guest-bringup-bb-faithful: clean all
 
 # Flash app via USB HID bootloader (bootloader must be running)
 flash: $(BUILD_DIR)/$(TARGET).bin
@@ -507,6 +547,25 @@ $(BUILD_DIR)/test_fpga_meter_plan: tests/test_fpga_meter_plan.c src/drivers/fpga
 test-fpga-meter-plan: $(BUILD_DIR)/test_fpga_meter_plan
 	$<
 
+$(BUILD_DIR)/test_meter_word_map: tests/test_meter_word_map.c src/drivers/fpga_meter_plan.c src/drivers/fpga_meter_plan.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Isrc/drivers $< src/drivers/fpga_meter_plan.c -o $@
+
+# The meter function-word map, from issue #15.
+#
+# ⚠ THIS TARGET IS EXPECTED TO FAIL. It is not broken, and it is deliberately
+# NOT part of `test-meter` or any other aggregate — a red aggregate teaches
+# people to ignore aggregates. Run it by name.
+#
+# stock_meter_cmd_low[] ties the right bytes to the wrong functions for 10 of
+# our 11 submodes (submode 0 "DCV" sends 0x0514, which is the SoC's Auto). The
+# correction is inbound as a contributor PR; when it lands, this target going
+# green IS the verification. Do not silence it by patching the table as a side
+# errand, and do not flip the AA 55 TX header default while it is still red.
+.PHONY: test-meter-word-map
+test-meter-word-map: $(BUILD_DIR)/test_meter_word_map
+	@echo "note: this target is EXPECTED to fail until the issue #15 word-table correction lands"
+	$<
+
 $(BUILD_DIR)/test_scope_measure: tests/test_scope_measure.c src/ui/scope_measure.c src/ui/scope_measure.h | $(BUILD_DIR)
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Isrc/ui $< src/ui/scope_measure.c -lm -o $@
 
@@ -527,6 +586,22 @@ $(BUILD_DIR)/test_scope_cal: tests/test_scope_cal.c src/ui/scope_cal.c src/ui/sc
 test-scope-cal: $(BUILD_DIR)/test_scope_cal
 	$<
 
+$(BUILD_DIR)/test_fw_loader: tests/test_fw_loader.c src/drivers/fw_loader.c src/drivers/fw_loader.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -DFW_LOADER_HOST_TEST -Isrc/drivers $< src/drivers/fw_loader.c -o $@
+
+# CDC firmware loader: tests the gates between a byte stream and an erased
+# app slot (size/CRC/vector/timeout), the staging byte-exactness, and that
+# apply() refuses anything not STAGED. The RAM installer itself is compiled
+# out on the host and is validated on hardware.
+#
+# Declared .PHONY here rather than appended to the shared list below: that
+# single long line is edited by every branch that adds a target, and it was
+# the only merge conflict this work produced, twice. A second .PHONY line is
+# equivalent to make and conflicts with nobody.
+.PHONY: test-fw-loader
+test-fw-loader: $(BUILD_DIR)/test_fw_loader
+	$<
+
 $(BUILD_DIR)/test_scope_timebase: tests/test_scope_timebase.c src/ui/scope_timebase.c src/ui/scope_timebase.h | $(BUILD_DIR)
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Isrc/ui $< src/ui/scope_timebase.c -lm -o $@
 
@@ -535,6 +610,21 @@ $(BUILD_DIR)/test_scope_timebase: tests/test_scope_timebase.c src/ui/scope_timeb
 # rates and all three were fitted to an incoherent record, so the test fails
 # the build if any of them is re-entered.
 test-scope-timebase: $(BUILD_DIR)/test_scope_timebase
+	$<
+
+$(BUILD_DIR)/test_scope_cursor: tests/test_scope_cursor.c src/ui/scope_cursor.c src/ui/scope_cursor.h \
+                                src/ui/scope_cal.c src/ui/scope_timebase.c | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Isrc/ui $< \
+		src/ui/scope_cursor.c src/ui/scope_cal.c src/ui/scope_timebase.c -lm -o $@
+
+# Cursor delta readouts. The cursor is the one feature whose whole purpose is
+# measurement, and its units used to come from two floats nothing ever updated.
+# The tests assert the two properties that stop that returning: the answer must
+# MOVE with the measured tables (a constant cannot depend on a code or a range),
+# and where there is no calibration there must be no unit. Includes four
+# negative controls, among them the historical constants transcribed verbatim.
+.PHONY: test-scope-cursor
+test-scope-cursor: $(BUILD_DIR)/test_scope_cursor
 	$<
 
 $(BUILD_DIR)/test_scope_freq: tests/test_scope_freq.c src/ui/scope_freq.c src/ui/scope_freq.h | $(BUILD_DIR)
@@ -548,22 +638,36 @@ test-scope-freq: $(BUILD_DIR)/test_scope_freq
 	./$<
 
 # Settings persistence: config.c + settings_store.c against a NOR flash model
-# (erase sets 0xFF, program only clears bits, page programs cannot cross a page).
+# (erase sets 0xFF, program only clears bits, page programs cannot cross a page),
+# with power cuts injected into the real write path.
 # Proves the round trip, the fallbacks (first boot / torn record / bad checksum /
-# foreign version), and — the one that matters — that the settings writer cannot
-# reach a read-only region. See tests/test_config_persist.c.
-$(BUILD_DIR)/test_config_persist: tests/test_config_persist.c src/util/config.c src/util/config.h \
-                                  src/util/settings_store.c src/util/settings_store.h \
-                                  src/drivers/flash_regions.c src/drivers/flash_regions.h \
-                                  src/ui/theme.c src/ui/scope_state.c \
-                                  src/ui/scope_cal.c src/ui/scope_timebase.c | $(BUILD_DIR)
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -O1 -DSETTINGS_PERSIST_WRITES=1 \
-		-Isrc/util -Isrc/drivers -Isrc/ui -Isrc/dsp \
-		$< src/util/config.c src/util/settings_store.c src/drivers/flash_regions.c \
-		src/ui/theme.c src/ui/scope_state.c src/ui/scope_cal.c src/ui/scope_timebase.c -o $@
+# foreign version / damage anywhere in the log), a change -> power cycle ->
+# verify loop across compaction, and — the one that matters — that the settings
+# writer cannot reach a read-only region. See tests/test_config_persist.c.
+#
+# The same file is built two ways:
+#   test_config_persist                SETTINGS_PERSIST_WRITES=1, must pass
+#   test_config_persist_nowrite        SETTINGS_PERSIST_WRITES=0, the negative
+#                                      control: the change/cycle/verify loop must
+#                                      FAIL to persist (spec settings-persistence S3)
+# (A third, known-defects build held the #57/#58 power-cut tests until those
+# were fixed; they run in test_config_persist now.)
+CONFIG_PERSIST_SRCS = src/util/config.c src/util/settings_store.c src/drivers/flash_regions.c \
+                      src/ui/theme.c src/ui/scope_state.c src/ui/scope_cal.c src/ui/scope_timebase.c
+CONFIG_PERSIST_DEPS = tests/test_config_persist.c $(CONFIG_PERSIST_SRCS) \
+                      src/util/config.h src/util/settings_store.h src/drivers/flash_regions.h
+CONFIG_PERSIST_CC   = $(HOST_CC) -std=c11 -Wall -Wextra -Werror -O1 \
+                      -Isrc/util -Isrc/drivers -Isrc/ui -Isrc/dsp
 
-test-config-persist: $(BUILD_DIR)/test_config_persist
-	$<
+$(BUILD_DIR)/test_config_persist: $(CONFIG_PERSIST_DEPS) | $(BUILD_DIR)
+	$(CONFIG_PERSIST_CC) -DSETTINGS_PERSIST_WRITES=1 $< $(CONFIG_PERSIST_SRCS) -o $@
+
+$(BUILD_DIR)/test_config_persist_nowrite: $(CONFIG_PERSIST_DEPS) | $(BUILD_DIR)
+	$(CONFIG_PERSIST_CC) -DSETTINGS_PERSIST_WRITES=0 $< $(CONFIG_PERSIST_SRCS) -o $@
+
+test-config-persist: $(BUILD_DIR)/test_config_persist $(BUILD_DIR)/test_config_persist_nowrite
+	$(BUILD_DIR)/test_config_persist
+	$(BUILD_DIR)/test_config_persist_nowrite
 
 test-stock-meter-literals:
 	python3 ../scripts/test_stock_meter_literals.py
@@ -578,7 +682,50 @@ $(BUILD_DIR)/test_redraw_gate: tests/test_redraw_gate.c src/ui/redraw_gate.h | $
 test-redraw-gate: $(BUILD_DIR)/test_redraw_gate
 	$<
 
-.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk fpga-alt-header
+# FFT on the live acquisition record (spec fft-live, S1/S3 host half):
+# head skip, bin -> Hz only from a known rate, refusal at rate 0, a tone in
+# the predicted bin, the window spanning the record — each with a negative
+# control. See tests/test_fft_live.c.
+$(BUILD_DIR)/test_fft_live: tests/test_fft_live.c src/dsp/fft_live.c src/dsp/fft_live.h \
+                            src/dsp/fft.c src/dsp/fft.h src/dsp/shared_mem.c \
+                            src/ui/scope_record.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc/dsp -Isrc/ui \
+		$< src/dsp/fft_live.c src/dsp/fft.c src/dsp/shared_mem.c -lm -o $@
+
+test-fft-live: $(BUILD_DIR)/test_fft_live
+	$<
+
+$(BUILD_DIR)/test_fuse: tests/test_fuse.c src/ui/fuse_model.c src/ui/fuse_model.h src/ui/fuse_table.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -Isrc/ui $< src/ui/fuse_model.c -lm -o $@
+
+# Fuse tester arithmetic, colours and shapes. Keeps the pre-2026-10-06 current
+# formula (amps printed as mA) as a negative control that must fail.
+test-fuse: $(BUILD_DIR)/test_fuse
+	$<
+
+# MCU-side trigger edge filter (trigger-modes S2 (c)): real EXP-55/56 records,
+# a level-off-the-signal negative control, and a synthetic period sweep.
+$(BUILD_DIR)/test_trig_edge: tests/test_trig_edge.c src/dsp/trig_edge.c src/dsp/trig_edge.h \
+                             tests/fixtures/trig_edge_records.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc/dsp -Itests \
+		$< src/dsp/trig_edge.c -lm -o $@
+
+test-trig-edge: $(BUILD_DIR)/test_trig_edge
+	$<
+
+# Waveform pass/fail masks (docs/specs/scope/mask-pass-fail.md): real records from
+# unit #1, aligned with the firmware's own trig_edge_anchor(); every acceptance
+# has a negative control that must come out the other way.
+$(BUILD_DIR)/test_mask_pf: tests/test_mask_pf.c src/dsp/mask_pf.c src/dsp/mask_pf.h \
+                           src/dsp/trig_edge.c src/dsp/trig_edge.h \
+                           tests/fixtures/mask_pf_records.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc/dsp -Itests \
+		$< src/dsp/mask_pf.c src/dsp/trig_edge.c -lm -o $@
+
+test-mask-pf: $(BUILD_DIR)/test_mask_pf
+	$<
+
+.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter
 
 # ═══════════════════════════════════════════════════════════════════════════
 # BENCH / EXPERIMENT IMAGE INDEX                          (index added 2026-08-13)
@@ -746,6 +893,43 @@ guest-configA: CFLAGS += -DGUEST_BUILD -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG
 guest-configA: LDSCRIPT = ld/at32f403a_guest.ld
 guest-configA: clean all
 
+# BIS-3 gap test (2026-08-25): guest-configA PLUS an inter-byte gap inserted into
+# the hardware-SPI 0x3B payload (FPGA_HW_UPLOAD_GAP_NOPS). Tests the ONE transport
+# difference byte-fidelity was blind to: hardware SPI streams the payload gaplessly
+# from the FIFO, bit-bang leaves ~1.4 us inter-byte gaps. Clock RATE was already
+# excluded (2026-06-12 BR sweep /16==/2); this varies the GAP on the same fast
+# clock. Overlay forced on so the CFG: line is readable WITHOUT CDC (this is a
+# hardware-SPI build; per the build-type correlation those lose USB CDC).
+#
+# Sweep GAP for ~1.4 us at 240 MHz (~100-350): `make guest-configA-gap GAP=200`.
+# READ: LCD overlay CFG: line. D1 = DONE_FINAL set -> the gapless FIFO stream was
+# the wall, and a gapped hardware-SPI path configures ~100x faster than bit-bang.
+# D0 = gaps are not the variable either; weight shifts back to prelude/state.
+# Zero-hardware arm of the config-transport bisect (runs on unit #1, no Tang Nano).
+GAP ?= 200
+guest-configA-gap: CFLAGS += -DGUEST_BUILD -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_A=1 -DFPGA_HW_UPLOAD_GAP_NOPS=$(GAP) -DSCOPE_DEBUG_OVERLAY
+guest-configA-gap: LDSCRIPT = ld/at32f403a_guest.ld
+guest-configA-gap: clean all
+
+# H2 (the converged lead — docs/config_entry_hw_spi_hypotheses.md): re-add
+# bb_cmd16's / stock's CS-HIGH 0x00 dummy byte before each HW-SPI prelude frame.
+# READ: LCD overlay CFG: line on a COLD FPGA (unplug/replug), anchor A0.
+#   D1 / A-1 / demo trace gone => the removed CS-high clocks WERE the error.
+#   D0 A0                      => H2 walls; fall back to -settle / -idle / LA.
+guest-configA-csdummy: CFLAGS += -DGUEST_BUILD -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_A=1 -DFPGA_HW_CS_DUMMY=1 -DSCOPE_DEBUG_OVERLAY
+guest-configA-csdummy: LDSCRIPT = ld/at32f403a_guest.ld
+guest-configA-csdummy: clean all
+
+# Post-H6 suspect (a): clock the mode-0 prelude frames (05/12/15) GAPLESSLY —
+# no mid-frame SCK idle between each command byte and its 0x00 — matching both
+# working transports (bit-bang + stock). LAST untested firmware axis after H1-H6.
+# READ: LCD overlay CFG: line on a COLD FPGA (unplug/replug), anchor A0.
+#   D1 / A-1 / demo trace gone => the intra-frame polled stall WAS the wall.
+#   D0 A0                      => cadence excluded; firmware exhausted => LA (H7).
+guest-configA-gapless: CFLAGS += -DGUEST_BUILD -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_A=1 -DFPGA_HW_PRELUDE_GAPLESS=1 -DSCOPE_DEBUG_OVERLAY
+guest-configA-gapless: LDSCRIPT = ld/at32f403a_guest.ld
+guest-configA-gapless: clean all
+
 # 0x05-omit test (2026-08-13, issue #18): the HARDWARE-SPI config path with the
 # 0x05 ERASE_SRAM frame skipped, so the prelude is 0x12 INIT_ADDR -> 0x15
 # CONFIG_ENABLE. This is the single-variable experiment maksidze proposed and we
@@ -762,7 +946,7 @@ guest-configA: clean all
 # bit-banging 115,638 bytes. 00039020 / D0 = unchanged wall -> 0x05 is not the
 # variable and the bit-bang/AF difference is what matters.
 # [LIVE] Other arm of the same open bisect: hardware-SPI with 0x05 omitted.
-guest-config05: CFLAGS += -DGUEST_BUILD -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_OMIT_05=1
+guest-config05: CFLAGS += -DGUEST_BUILD -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_OMIT_05=1 -DSCOPE_DEBUG_OVERLAY
 guest-config05: LDSCRIPT = ld/at32f403a_guest.ld
 guest-config05: clean all
 
@@ -866,6 +1050,39 @@ guest-coldtrace: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART
 guest-coldtrace: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace: clean all
 
+# [M1 2026-09-04] guest-coldtrace-meter — coldtrace plus reachable meter submodes.
+#
+# EXP-23 measured the actual gap in guest-coldtrace: the meter is NOT dead (a
+# 1.61 V cell reads 1.6158 V while SPI3 acquisition keeps running), but all 11
+# submodes drive a bit-identical analog frontend and an identical TX frame,
+# because FPGA_WARM_HANDOFF_TEST no-ops fpga_set_meter_mode(). Only DC Voltage
+# is reachable, and only because that happens to be the posture it boots in.
+#
+# FPGA_METER_SUBMODES lets meter entry posture the frontend per submode, and
+# makes scope entry put the scope posture back (the frontend is shared). It
+# deliberately does NOT re-enable fpga_scope_reinit() or fpga_enter_scope_mode():
+# those also re-send USART sequences and reset data_ready, and this build's
+# configured/armed FPGA state is not something to spend on a mode switch.
+#
+# ⚠ ACCEPTANCE TEST BEFORE FOLDING THIS INTO guest-coldtrace — the frontend is
+# shared, so the risk is that a visit to the meter breaks the scope:
+#   1. scope captures (SPI3 OK climbing)                    <- must hold
+#   2. mode meter 0, cell on leads, reads correctly          <- EXP-23 baseline
+#   3. mode meter 6, `gpio scan` diff vs step 2 NON-EMPTY    <- the actual fix
+#   4. mode scope, SPI3 OK still climbing, trace still right <- the regression
+# Step 4 is the one that decides whether this ships.
+guest-coldtrace-meter: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_METER_SUBMODES=1
+guest-coldtrace-meter: LDSCRIPT = ld/at32f403a_guest.ld
+guest-coldtrace-meter: clean all
+
+# H7 confirmation (2026-08-26): coldtrace's warm-handoff + live-readout pipeline,
+# but config via HARDWARE-SPI at /2 (stock's write rate) instead of bit-bang. Tests
+# whether HW-SPI /2 config is a REAL config (live trace) — the shell A/B showed it
+# closes the port where /256 walls. NOT FPGA_CONFIG_B (that is the bit-bang path).
+guest-coldtrace-hwspi: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_A_HWSPI=1
+guest-coldtrace-hwspi: LDSCRIPT = ld/at32f403a_guest.ld
+guest-coldtrace-hwspi: clean all
+
 # [CH2 OFFSET 2026-08-17] guest-coldtrace-ch2 — coldtrace plus a boot-time arm
 # of the CH2 vertical-offset reference (TMR13 CH1 PWM-DAC on PA6).
 #
@@ -880,18 +1097,23 @@ guest-coldtrace: clean all
 #
 # This target only sets FPGA_CH2_TRIGGER, which arms TMR13 at boot alongside
 # the DAC1 write. The runtime knobs (`trig2 raw`, `fpga scope center ch2`)
-# self-init and work on ANY build, so the experiment does NOT require this
-# target — flash it once the pin is confirmed and you want the arm at boot.
+# self-init and work on ANY build.
 #
-# ⚠ PA6 is DECODED, NOT CONFIRMED (HARDWARE_PINOUT.md: "candidate,
-# unconfirmed"). It is derived from stock's master_init TMR13 setup at
-# 0x0802B0FE and the C1DT write at 0x08008C3A (ripcord contract 38). Run the
-# CH1 DAC1 sweep as a positive control in the same session before believing a
-# negative here: if DAC1 moves CH1's mean and this moves nothing on CH2, the
-# pin is wrong — which is a clean result, not an ambiguous one.
+# PA6 CONFIRMED as the CH2 offset reference: EXP-07 (2026-08-17, TMR13 moves
+# CH2's mean, DAC1 does not) and EXP-21 (2026-08-21, independent CH2 signal +
+# Lissajous once armed). FPGA_CH2_TRIGGER defaults to 1 in fpga.c since
+# 2026-09-14, so this target is now IDENTICAL to guest-coldtrace and is kept
+# as a name people have in their notes. The A/B control is
+# guest-coldtrace-noch2 below: same image with the CH2 arm compiled out.
 guest-coldtrace-ch2: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_CH2_TRIGGER=1
 guest-coldtrace-ch2: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace-ch2: clean all
+
+# Control build for the CH2 arm: coldtrace with FPGA_CH2_TRIGGER=0, i.e. the
+# image every "CH2 reads all zeros" note before 2026-09-14 was taken on.
+guest-coldtrace-noch2: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_CH2_TRIGGER=0
+guest-coldtrace-noch2: LDSCRIPT = ld/at32f403a_guest.ld
+guest-coldtrace-noch2: clean all
 
 # [LA 2026-08-15] guest-coldtrace-la — coldtrace with the bit-bang config clock
 # slowed (FPGA_BB_HALF_DELAY=60 nops per half period, ~1-2 MHz SCK) so a

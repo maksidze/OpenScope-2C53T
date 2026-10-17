@@ -60,8 +60,12 @@
 /* Runtime commands */
 #define FPGA_CMD_RESET        0x00
 #define FPGA_CMD_SCOPE_CH     0x01   /* Scope channel config */
-#define FPGA_CMD_METER_START  0x09   /* Start meter measurement */
-#define FPGA_CMD_METER_NOPROBE 0x0A  /* Meter PC7-low command tail */
+#define FPGA_CMD_METER_START  0x09   /* Legacy name. Obeyed, 0x0509 puts the SoC's
+                                      * display into a non-measurement state ("EF");
+                                      * sent unobeyed it is keepalive traffic. */
+#define FPGA_CMD_METER_NOPROBE 0x0A  /* Legacy name for the "PC7-low tail". 0x050A is
+                                      * the SoC's CAPACITANCE selector (issue #15);
+                                      * never send it obeyed outside a transition. */
 
 /* Scope configuration commands (case 0 of mode init dispatcher FUN_0800b908).
  * Sent as a sequence when entering oscilloscope mode: 0x0B-0x11.
@@ -75,10 +79,12 @@
 #define FPGA_CMD_SCOPE_CFG_10 0x10   /* Scope config: timebase period */
 #define FPGA_CMD_SCOPE_CFG_11 0x11   /* Scope config: timebase mode */
 
-/* Meter variant setup (system_mode 9: resistance) */
-#define FPGA_CMD_METER_VAR_12 0x12   /* Meter variant config */
-#define FPGA_CMD_METER_VAR_13 0x13   /* Meter variant config */
-#define FPGA_CMD_METER_VAR_14 0x14   /* Meter variant config */
+/* Legacy "meter variant" names. Measured (issue #15): these are function
+ * selectors of the meter SoC, not variant setup. The canonical per-submode
+ * table is stock_meter_word_low_for_submode[] in fpga_meter_plan.c. */
+#define FPGA_CMD_METER_VAR_12 0x12   /* Temperature */
+#define FPGA_CMD_METER_VAR_13 0x13   /* LIVE (NCV screen; frame is the text "L1uE") */
+#define FPGA_CMD_METER_VAR_14 0x14   /* Auto -- the SoC's own autorange-everything */
 
 /* Scope channel command family 0x1A..0x1E. Stock scope xrefs use these as
  * channel gain/offset/coupling commands. The DMM boot dispatcher also queues
@@ -224,6 +230,21 @@ typedef struct {
     volatile uint8_t  tx_cmd_history_head;   /* Next history slot */
     volatile uint8_t  tx_cmd_history_count;  /* Valid history entries */
     volatile uint8_t  last_tx_frame[FPGA_TX_FRAME_SIZE]; /* Last full 10-byte USART frame sent */
+    /* Low byte of the last frame sent with OBEY set — i.e. the last frame the
+     * meter could actually have acted on. The echo validator MUST compare
+     * against this and not last_tx_frame[3]: the 4 Hz unobeyed keepalive
+     * overwrites last_tx_frame inside the ~250 ms window between a command and
+     * its echo, which made good echoes fail validation (EXP-27). */
+    volatile uint8_t  last_obeyed_tx_lo;
+    volatile bool     last_obeyed_tx_valid;
+    /* Last meter transition (EXP-205): ms from PC11 back up to the SoC's first
+     * data frame (0xFFFF = timed out), selector sends until its echo, whether
+     * it was confirmed, and how many transitions ended unconfirmed. */
+    volatile uint16_t meter_soc_wake_ms;
+    volatile uint8_t  meter_selector_attempts;
+    volatile uint8_t  meter_selector_confirmed;
+    volatile uint16_t meter_selector_unconfirmed_total;
+    volatile uint16_t meter_soc_wake_timeouts;
     volatile uint8_t  tx_frame_history[FPGA_TX_FRAME_HISTORY][FPGA_TX_FRAME_SIZE];
     volatile uint16_t tx_frame_history_tx_count[FPGA_TX_FRAME_HISTORY];
     volatile uint8_t  tx_frame_history_head;
@@ -352,6 +373,17 @@ typedef struct {
                                             * b2==0x01 is a buffer-valid flag — set on
                                             * 143/174 CH1 windows, NEVER on CH2. */
     volatile uint8_t  acq_hdr_ch2[3];      /* Same for the last 0x05 read */
+    volatile uint32_t pc0_last_tick;       /* tick of the last PC0 edge (EXP-50 latency) */
+    volatile uint32_t pc0_last_cyc;        /* DWT cycle count at the last PC0 edge (EXP-52) */
+    volatile uint32_t arm_read_cyc;        /* DWT cycle count at the start of the last 0x04 read */
+    volatile int32_t  acq_last_rot;        /* rotation L applied to the last committed record, -1 = none */
+    volatile uint32_t acq_last_lat_us;     /* arming read -> PC0 edge, microseconds, last cycle */
+    volatile uint32_t acq_last_latency_ms; /* edge -> commit of the held record, last cycle */
+    volatile uint32_t acq_poll_reads;      /* EXP-54: reads that found the rolling buffer (no strobe), total */
+    volatile uint32_t acq_polls_last;      /* EXP-54: such reads before the last handover */
+    volatile uint32_t acq_edge_kept;       /* edge filter: strobed records of the chosen edge */
+    volatile uint32_t acq_edge_dropped;    /* edge filter: strobed records of the other edge */
+    volatile uint32_t acq_edge_unknown;    /* edge filter: not classifiable -> committed unfiltered */
     volatile uint32_t pc0_edges;           /* PC0 (data-ready) falling edges via EXINT0.
                                             * One per fresh ready event — the instrument
                                             * for engine cycle rate per trigger regime,
@@ -594,11 +626,30 @@ typedef struct {
                                *     answer is the prelude, not the bit-bang — and we
                                *     get a config path ~100x faster than bit-banging
                                *     115,638 bytes. Applies to all prelude_frame_modes. */
+    uint8_t  single_br;       /* 1 = NEVER call spi3_set_br() during the config
+                               *     transaction (prelude → upload → close), so SPE
+                               *     is toggled ZERO times between fpga_init and the
+                               *     0x3A close — exactly like stock, which sets BR
+                               *     once at init and never touches it again. The
+                               *     sequence runs at whatever divider the caller
+                               *     already programmed (fpga_init leaves /2). Our
+                               *     normal path toggles SPE via spi3_set_br() BEFORE
+                               *     the prelude (fpga.c:4280) — a pre-0x15 glitch
+                               *     stock never produces (EXP-34). Post-0x15
+                               *     measurement reads (probe_edit, 0x41 STATUS) still
+                               *     switch to /256; they are downstream of the wall
+                               *     and cannot retro-cause it. */
 } fpga_cfg_seq_opts_t;
 
 /* Run the full SPI3 config handshake. Returns the 0x3A close status byte
  * (stock: 0xF8). Fills fpga.init_hs[], fpga.h2_close_status, fpga.scope_status[]. */
 uint8_t fpga_spi3_config_sequence(const fpga_cfg_seq_opts_t *opt);
+
+/* GPIO bit-bang SSPI config (2C23T-V0.4 transplant, FPGA_CONFIG_B). Owns
+ * PB3/4/5/6 as GPIO for the handshake, then restores PB3/4/5 to SPI3 AF.
+ * Returns cfg_status_reg[3]; populates fpga.cfg_status_reg[] (post-upload STATUS)
+ * and fpga.probe_id_bit_close. Only defined under FPGA_CONFIG_B. */
+uint8_t fpga_bitbang_config_sequence(void);
 
 /* ═══════════════════════════════════════════════════════════════════
  * API
@@ -649,6 +700,32 @@ BaseType_t fpga_send_cmd(uint8_t cmd_high, uint8_t cmd_low);
  * recorded VOID because it did not.
  */
 bool fpga_usart_tx_task_exists(void);
+
+/* Meter TX frame header (EXP-25, issue #15). Default true = AA 55, the header
+ * the meter SoC requires (measured on two units). False = 00 00, the header
+ * every measurement before 2026-09-12 was taken with; kept as the bench's
+ * negative control (`meter hdr off`). */
+/* usart_tx_queue item: bits 0-7 cmd_lo, 8-15 cmd_hi, bit 16 = OBEY.
+ * OBEY set   means "a command to the meter SoC": AA 55 while the header is on.
+ * OBEY clear means "send this frame with the 00 00 header the meter ignores".
+ * That is not a hack — EXP-25 measured that the meter emits data frames in
+ * response to USART TRAFFIC, not to commands it accepts (header off, zero
+ * echoes, data still 6/s; transmit stopped, data 0/s). So the 4 Hz keepalive
+ * only has to make noise, and it must NOT be obeyed, or every poll re-triggers
+ * a measurement and autorange — audible as continuous relay clicking. */
+#define FPGA_TX_OBEY_BIT  (1U << 16)
+
+void fpga_meter_tx_header_set(bool aa55);
+bool fpga_meter_tx_header_get(void);
+
+/* Queue a frame UNOBEYED: 00 00 header regardless of the header setting. For
+ * traffic that has always gone out 00 00 and must stay bit-identical now that
+ * obeyed frames are real (legacy scope/siggen/config words, diagnostics that
+ * replay stock's byte stream without meaning to switch the meter). */
+BaseType_t fpga_send_cmd_unobeyed(uint8_t cmd_high, uint8_t cmd_low);
+
+/* Keepalive send: solicits a data frame without being obeyed. */
+BaseType_t fpga_send_cmd_keepalive(uint8_t cmd_high, uint8_t cmd_low);
 
 /*
  * Send one 2-byte command frame with the POLLED byte-level path, bypassing
@@ -738,6 +815,25 @@ void fpga_set_active(bool active);
  * esp32-bringup branch (tools/esp32_sspi_bringup/). Re-flash to undo.
  */
 void fpga_bus_release(void);
+
+/*
+ * Re-acquire the SPI3 bus after fpga_bus_release() (H7, 2026-08-26).
+ * Restores PB3(SCK)/PB5(MOSI) to SPI3 AF, PB4(MISO) to input pull-up (stock's
+ * defined idle level), PB6(CS) to GPIO output HIGH, re-programs CTRL1/CTRL2/SPE,
+ * stages PC6 HIGH, and clears fpga.bus_released. Lets a guest-bringup boot (which
+ * leaves the FPGA config port pristine + CDC alive) hand the bus back to the MCU
+ * so `fpga reinit` can drive the failing hardware-SPI prelude on demand.
+ */
+void fpga_spi3_bus_reacquire(void);
+
+/* EXP-37: LA edge-capture. Emits `reps` (0 => 16) identical 0x15 CONFIG_ENABLE
+ * frames over AF hardware-SPI3 (/256), a 60ms gap, then `reps` over GPIO bit-bang
+ * — same pins/rate/frame, drive type the only variable. Isolated frames; does NOT
+ * configure. Arm sigrok (D0=SCK/D1=MISO/D2=MOSI/D3=CS) before calling.
+ * FPGA_CONFIG_B builds only — the bit-bang half is compiled out elsewhere. */
+#if FPGA_CONFIG_B
+void fpga_edgecap_15(uint8_t reps);
+#endif
 
 /*
  * Cooperative acquisition pause (Step 0b, bench plan 2026-08-14).
@@ -949,6 +1045,12 @@ void fpga_stock_diag_bridge_dynamic(uint8_t bank_mode);
  *   1 = CH2 candidate bank
  *   2 = CH1 + CH2 candidate banks
  */
+/* fpga_wire_send_word() is OBEYED: with the AA 55 header on, a 0x05xx word
+ * sent here switches the meter SoC's function (`fpga wire words`). The batch
+ * replays -- fpga_wire_entry(), fpga_wire_scope_sequence() and the stock-diag
+ * bridges -- send their words UNOBEYED: they probe the FPGA config-entry path
+ * with stock's byte stream, and their bank words are eight live meter
+ * selectors plus 0x0501 (Auto) and 0x0503 (unmeasured). Shell only. */
 void fpga_wire_send_word(uint16_t word, uint32_t delay_ms);
 void fpga_wire_entry(uint8_t bank_mode);
 void fpga_wire_scope_sequence(uint8_t bank_mode);
@@ -982,6 +1084,20 @@ extern volatile bool fpga_meter_needs_activation;
 
 void    fpga_acq_rearm_set(bool on);
 bool    fpga_acq_rearm_get(void);
+/* Settle time after the re-arm write before the next read (EXP-40); 0 = none. */
+void     fpga_acq_rearm_wait_set(uint16_t ms);
+uint16_t fpga_acq_rearm_wait_get(void);
+/* AUTO-mode edge-wait budget before the free-run fallback read (EXP-42); 0 = compiled default. */
+void     fpga_acq_auto_wait_set(uint16_t ms);
+uint16_t fpga_acq_auto_wait_get(void);
+
+/* Stock's acquisition GATE: in AUTO, refuse to read without a data-ready
+ * edge instead of free-running across the engine's write pointer (EXP-29
+ * located the seam there). Default OFF, and meant to be used WITH the
+ * re-arm above — see the block comment in fpga.c. */
+void     fpga_acq_gate_set(bool on);
+bool     fpga_acq_gate_get(void);
+uint32_t fpga_acq_gate_skips(void);
 /* Apply a timebase code (SPI reg 0x01) to the hardware and record it as the
  * value in force. This is the ONLY correct way to change the sample rate:
  * writing scope_state.timebase_idx alone relabels the axis without touching
@@ -990,6 +1106,54 @@ bool    fpga_acq_rearm_get(void);
  * Returns false if the acquisition task would not park, in which case NOTHING
  * was written and the previous rate is still in force. */
 bool    fpga_apply_timebase(uint8_t code);
+
+/* Trigger sibling (EXP-41): write the digital trigger level, reg 0x08, from
+ * the UI's -100..100 and record the code in force. Same park contract. */
+bool    fpga_apply_trigger_level(int level);
+uint8_t fpga_trigger_code_from_level(int level);
+uint8_t fpga_acq_trig_code_get(void);
+bool    fpga_acq_auto_wait_is_override(void);
+void     fpga_acq_pair_gap_set(uint16_t ms);
+void     fpga_acq_post_edge_set(uint16_t ms);
+uint16_t fpga_acq_post_edge_get(void);
+bool     fpga_acq_post_edge_is_override(void);
+/* EXP-50: delay from the PC0 edge to the read of the HELD record (committed),
+ * derived fill + 30 ms; the arming read follows at fpga_acq_post_edge_get(). */
+void     fpga_acq_poll_gap_set(uint16_t ms);   /* EXP-54: poll cadence, ms (0 -> 30) */
+uint16_t fpga_acq_poll_gap_get(void);
+/* EXP-72 handover log (heap, 128 entries; see fpga.c). */
+#define FPGA_HOLDLOG_N 128u
+typedef struct { uint16_t dt_ms; uint8_t polls; uint8_t edges; } fpga_holdlog_ent_t;
+/* Ask the meter poll task to switch the meter chip to `submode` (returns at
+ * once; the newest request wins). fpga_set_meter_mode() is the blocking form. */
+void     fpga_request_meter_mode(uint8_t submode);
+bool     fpga_holdlog_start(void);
+void     fpga_holdlog_stop(void);
+bool     fpga_holdlog_active(void);
+uint16_t fpga_holdlog_count(void);
+bool     fpga_holdlog_get(uint16_t i, fpga_holdlog_ent_t *out);
+void     fpga_acq_auto_live_set(bool on);
+bool     fpga_acq_auto_live_get(void);
+void     fpga_acq_edge_filter_set(bool on);    /* MCU-side trigger edge filter (EXP-55 follow-up) */
+bool     fpga_acq_edge_filter_get(void);
+/* true when the latest committed record was un-rotated at its seam, so the
+ * hardware trigger sits at index 512 (dev plan 2.3). */
+bool     fpga_acq_record_time_ordered(void);
+/* true when this build creates the meter-waveform sampler task ("mtr_wave").
+ * The coldtrace family does not, so its meter screen must not wait for
+ * samples that never come (2026-09-30). */
+bool     fpga_meter_wave_available(void);
+/* EXP-52: un-rotate the record so index 0 is the trigger crossing. The FPGA's
+ * capture memory is read from address 0; the write pointer starts at the
+ * arming read and reaches L at the crossing, so the readout is rotated by L
+ * = latency x fs. `offset` is a calibration term in samples added to L. */
+void     fpga_acq_unrotate_set(bool on);
+bool     fpga_acq_unrotate_get(void);
+void     fpga_acq_unrotate_offset_set(int16_t samples);
+int16_t  fpga_acq_unrotate_offset_get(void);
+void     fpga_acq_read_br_set(uint8_t br);
+uint8_t  fpga_acq_read_br_get(void);
+uint16_t fpga_acq_pair_gap_get(void);
 
 /* Vertical sibling of fpga_apply_timebase (EXP-19): drive channel ch's
  * (1 or 2) frontend relay bank to range idx. The caller owns updating
@@ -1009,6 +1173,12 @@ uint8_t fpga_timebase_reconcile_action(void);
  * call. Pre-scheduler only: takes no lock. */
 void    fpga_reconcile_timebase_after_arm(void);
 void    fpga_reconcile_frontend_after_arm(void);
+/* Drive one channel's AC/DC coupling relay (PD12 CH1 / PD13 CH2, HIGH = DC)
+ * and verify it by readback. false = not applied (GND, or the pin is not a
+ * GPIO output in this build) -- the caller must not relabel. */
+bool    fpga_apply_coupling(uint8_t ch, uint8_t coupling);   /* a coupling_t */
+void    fpga_reconcile_trigger_after_arm(void);
+uint8_t fpga_trigger_reconcile_code(void);
 
 void    fpga_acq_rate_idx_set(uint8_t v);
 uint8_t fpga_acq_rate_idx_get(void);

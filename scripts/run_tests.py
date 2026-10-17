@@ -43,6 +43,8 @@ SCRIPTS = Path(__file__).resolve().parent
 SUITES = (
     "test_iap_erase_guard.py",
     "test_flash_regions.py",
+    "test_config_persist.py",
+    "test_cal_backup.py",
     "test_flash_switcher.py",
     "test_flash_preflight.py",
     "test_bootloader_updater.py",
@@ -52,6 +54,8 @@ SUITES = (
     "test_stock_settings.py",
     "test_stock_settings_diff.py",
     "test_shell_table.py",
+    "test_stock_caplog.py",
+    "test_ramfunc_isolated.py",
     "test_firmware_build.py",
 )
 

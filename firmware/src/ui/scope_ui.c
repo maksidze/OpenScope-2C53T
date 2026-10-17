@@ -18,10 +18,21 @@
 #include "scope_measure.h"
 #include "scope_cal.h"
 #include "scope_timebase.h"
+#include "scope_cursor.h"
 #include "scope_freq.h"
+#include "scope_record.h"
 #include "math_channel.h"
 #include "persistence.h"
 #include "fpga.h"
+#include "FreeRTOS.h"   /* pvPortMalloc — the X-Y snapshot buffers */
+#include "task.h"       /* xTaskGetTickCount — the out-of-scope popup overlay */
+#include "scope_trigger.h"
+#include "trig_edge.h"
+#include "scope_mask.h"
+#ifdef FEATURE_FFT
+#include "fft_live.h"
+#include "fft_test_signals.h"
+#endif
 #include "at32f403a_407.h"  /* GPIO port reads in the debug overlay */
 #include <stdio.h>
 #include <math.h>
@@ -91,6 +102,17 @@ static bool popup_painted = false;
 
 #define POPUP_DURATION 10  /* ~500ms at 20fps */
 
+/* Popups outside the scope (2026-10-06, softkey UI P0; findings F15, F20).
+ * The scope's popup is counted in scope frames, and only the scope renderer
+ * counted them -- so a popup raised in the meter, siggen or settings never
+ * appeared there, and turned up stale on the next scope visit. Outside the
+ * scope it is now a tick-timed overlay the display task services, sized to
+ * its text instead of a fixed 200 px box. */
+#define POPUP_OVERLAY_MS 1200u
+static bool     ov_pending;
+static bool     ov_drawn;
+static uint32_t ov_until;
+
 void scope_show_popup(const char *text)
 {
     int i = 0;
@@ -99,8 +121,58 @@ void scope_show_popup(const char *text)
         i++;
     }
     popup_text[i] = '\0';
-    popup_frames = POPUP_DURATION;
-    popup_painted = false;
+    if (current_mode == MODE_OSCILLOSCOPE) {
+        popup_frames = POPUP_DURATION;
+        popup_painted = false;
+    } else {
+        popup_frames = 0;
+        ov_pending = true;
+        ov_drawn = false;
+        ov_until = xTaskGetTickCount() + pdMS_TO_TICKS(POPUP_OVERLAY_MS);
+    }
+}
+
+static void draw_overlay_box(void)
+{
+    const theme_t *th = theme_get();
+    const font_t *f = &font_large;
+    uint16_t tw = font_string_width(popup_text, f);
+    if (tw > LCD_WIDTH - 28) { f = &font_medium; tw = font_string_width(popup_text, f); }
+    uint16_t w = tw + 24;
+    if (w > LCD_WIDTH - 4) w = LCD_WIDTH - 4;
+    uint16_t h = (uint16_t)(f->height + 12);
+    uint16_t x = (uint16_t)((LCD_WIDTH - w) / 2);
+    uint16_t y = (uint16_t)((LCD_HEIGHT - h) / 2);
+    lcd_fill_rect(x, y, w, 1, th->highlight);
+    lcd_fill_rect(x, y + h - 1, w, 1, th->highlight);
+    lcd_fill_rect(x, y + 1, 1, h - 2, th->highlight);
+    lcd_fill_rect(x + w - 1, y + 1, 1, h - 2, th->highlight);
+    lcd_fill_rect(x + 1, y + 1, w - 2, 5, th->background);
+    font_draw_string_box(x + 1, y + 6, w - 2, popup_text, th->text_primary,
+                         th->background, f, FONT_ALIGN_CENTER);
+    lcd_fill_rect(x + 1, y + 6 + f->height, w - 2, (uint16_t)(h - 7 - f->height), th->background);
+}
+
+int ui_popup_overlay_service(bool screen_repainted)
+{
+    if (!ov_pending) return 0;
+    if ((int32_t)(xTaskGetTickCount() - ov_until) >= 0) {
+        ov_pending = false;
+        ov_drawn = false;
+        return 2;                       /* expired: caller repaints the screen */
+    }
+    if (!ov_drawn || screen_repainted) {
+        draw_overlay_box();
+        ov_drawn = true;
+        return 1;
+    }
+    return 0;
+}
+
+void ui_popup_overlay_cancel(void)
+{
+    ov_pending = false;
+    ov_drawn = false;
 }
 
 bool scope_popup_active(void)
@@ -139,10 +211,12 @@ void draw_scope_grid(void)
  * Trigger level indicator
  * ═══════════════════════════════════════════════════════════════════ */
 
-static void draw_trigger_indicator(const scope_state_t *ss, const theme_t *th)
+/* trig_y comes from trigger_marker_y_*() below: the row where the HARDWARE
+ * fires, not `level` pixels above centre (which is what this drew until
+ * 2026-09-22, unrelated to an autofit trace). */
+static void draw_trigger_indicator(const scope_state_t *ss, const theme_t *th,
+                                   int16_t trig_y)
 {
-    /* Trigger level as pixel Y position */
-    int16_t trig_y = SCOPE_MID_Y - ss->trigger.level;
     if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
     if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
 
@@ -158,8 +232,9 @@ static void draw_trigger_indicator(const scope_state_t *ss, const theme_t *th)
     lcd_set_pixel(ax - 1, (uint16_t)(trig_y + 1), th->trigger);
     lcd_set_pixel(ax - 2, (uint16_t)(trig_y + 2), th->trigger);
 
-    /* Dotted horizontal line at trigger level */
-    for (uint16_t x = 0; x < LCD_WIDTH - 6; x += 4)
+    /* Dotted horizontal line at trigger level; denser while UP/DOWN are
+     * adjusting it, so the user can see which control the arrows own. */
+    for (uint16_t x = 0; x < LCD_WIDTH - 6; x += (scope_trig_level_focus ? 2u : 4u))
         lcd_set_pixel(x, (uint16_t)trig_y, th->trigger);
 
     /* Trigger edge indicator (small arrow next to the trigger arrow) */
@@ -324,8 +399,8 @@ static bool measure_live_channel(const volatile uint8_t *buf,
 }
 
 /* No float formatting: the firmware links newlib-nano without
- * -u _printf_float, so "%f" prints nothing. Tenths are assembled by hand,
- * exactly as format_si()/format_freq() do below. */
+ * -u _printf_float, so "%f" prints nothing. Tenths are assembled by hand
+ * here, and in scope_cursor.c for the cursor readout. */
 static void fmt_counts(char *b, size_t n, unsigned v)
 {
     snprintf(b, n, "%ucnt", v);
@@ -427,6 +502,92 @@ _Static_assert(SCOPE_TIMEBASE_SAMPLES_PER_DIV == 32.0f,
                "grid pitch no longer matches SCOPE_TIMEBASE_SAMPLES_PER_DIV");
 _Static_assert(SCOPE_TIMEBASE_CODE_COUNT == TIMEBASE_COUNT,
                "timebase rate table length must match TIMEBASE_COUNT");
+
+/* The cursor readout converts a pixel delta into a sample delta with this,
+ * and it is true only because draw_channel_autofit()/draw_channel_fixed()
+ * plot buf[x] at column x. Decimating or interpolating the plot without
+ * changing this would silently rescale every cursor dt. */
+_Static_assert(SCOPE_CURSOR_SAMPLES_PER_PIXEL == 1.0f,
+               "the plot no longer draws one sample per column — "
+               "cursor dt and 1/dt would be wrong");
+
+/*
+ * Mask readout: the third slot of badge row 2 (where the legend sits when no
+ * mask exists). Below the live band, so the compositor never paints over it,
+ * and refreshed on its own epoch from main.c (scope_ui_mask_slot_refresh) --
+ * the measurement badges' "stale until the next full repaint" is exactly the
+ * defect a pass/fail counter must not have. A SKIP is shown as such: a
+ * frozen PASS count over records that are no longer being judged would be
+ * the project's signature stable-plausible-wrong number.
+ */
+#define MASK_SLOT_X ((uint16_t)(2u + 2u * (BADGE_W + 2u)))
+
+static const char *mask_skip_short(mask_pf_reason_t r)
+{
+    switch (r) {
+    case MASK_PF_R_STALE:       return "stale";
+    case MASK_PF_R_UNTRIGGERED: return "free-run";
+    case MASK_PF_R_NOT_ORDERED: return "no seam";
+    case MASK_PF_R_NO_ANCHOR:   return "no trig";
+    case MASK_PF_R_SETTINGS:    return "settings";
+    case MASK_PF_R_SPAN:        return "span";
+    case MASK_PF_R_CLIPPED:     return "clipped";
+    default:                    return "?";
+    }
+}
+
+static void draw_legend_slot(const theme_t *th, bool live)
+{
+    const uint16_t x = MASK_SLOT_X, y = BADGE_ROW2_Y;
+    const char *note = live ? "cnt=ADC raw  --=no tb/cal" : "DEMO trace - no capture";
+    lcd_fill_rect(x, y, (uint16_t)(LCD_WIDTH - x), BADGE_H, th->background);
+    if (font_string_width(note, &font_small) > LCD_WIDTH - x)
+        note = live ? "--=no tb/cal" : "DEMO trace";
+    font_draw_string(x, y + 1, note, th->text_secondary, th->background, &font_small);
+}
+
+static void draw_mask_slot(const theme_t *th)
+{
+    scope_mask_summary_t m;
+    scope_mask_summary(&m);
+    char b[32];
+    uint16_t c = th->text_secondary;
+    const uint16_t x = MASK_SLOT_X, y = BADGE_ROW2_Y;
+
+    if (m.state == MASK_PF_TEACHING) {
+        if (m.teach_last_reject != MASK_PF_R_OK)
+            snprintf(b, sizeof(b), "MASK teach %u/%u %s", (unsigned)m.teach_got,
+                     (unsigned)m.teach_target, mask_skip_short(m.teach_last_reject));
+        else
+            snprintf(b, sizeof(b), "MASK teach %u/%u", (unsigned)m.teach_got,
+                     (unsigned)m.teach_target);
+        c = th->highlight;
+    } else if (m.hold) {
+        snprintf(b, sizeof(b), "FAIL %lu/%lu HOLD-OK", (unsigned long)m.failed,
+                 (unsigned long)m.tested);
+        c = th->warning;
+    } else if (m.last.verdict == MASK_PF_V_SKIP) {
+        snprintf(b, sizeof(b), "MASK skip: %s", mask_skip_short(m.last.reason));
+        c = th->highlight;
+    } else if (m.tested == 0u) {
+        snprintf(b, sizeof(b), "MASK ready");
+        c = th->success;
+    } else {
+        snprintf(b, sizeof(b), "P%lu F%lu", (unsigned long)m.passed,
+                 (unsigned long)m.failed);
+        c = (m.last.verdict == MASK_PF_V_FAIL) ? th->warning : th->success;
+    }
+    lcd_fill_rect(x, y, (uint16_t)(LCD_WIDTH - x), BADGE_H, th->background);
+    font_draw_string(x, y + 1, b, c, th->background, &font_small);
+}
+
+void scope_ui_mask_slot_refresh(void)
+{
+    if (scope_mask_state() == MASK_PF_EMPTY)
+        draw_legend_slot(theme_get(), fpga_data_ready());   /* mask just cleared */
+    else
+        draw_mask_slot(theme_get());
+}
 
 /*
  * Measurement badges.
@@ -620,15 +781,11 @@ static void draw_measurement_badges(const scope_state_t *ss, const theme_t *th)
      * without the source: it says, on the instrument itself, whether the
      * trace is real and why the missing values are missing.
      */
-    {
-        const char *note = (have1 || have2) ? "cnt=ADC raw  --=no tb/cal"
-                                            : "DEMO trace - no capture";
-        lcd_fill_rect(x, y2, (uint16_t)(LCD_WIDTH - x), BADGE_H,
-                      th->background);
-        if (font_string_width(note, &font_small) > LCD_WIDTH - x)
-            note = (have1 || have2) ? "--=no tb/cal" : "DEMO trace";
-        font_draw_string(x, y2 + 1, note, na, th->background, &font_small);
-    }
+    (void)x; (void)na;
+    if (scope_mask_state() != MASK_PF_EMPTY)
+        draw_mask_slot(th);        /* the mask readout takes the legend's slot */
+    else
+        draw_legend_slot(th, have1 || have2);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -714,8 +871,13 @@ typedef struct {
     uint8_t mn;
 } autofit_t;
 
+/* mask_ch: the channel this band draws (0/1), or -1. When a finished mask
+ * covers it, the fit also spans the mask's extent, so the bounds drawn over
+ * the trace stay on the glass instead of clamping to the band edge. Every
+ * caller passes the channel it draws -- trace, compositor, trigger marker --
+ * so all three keep agreeing on the scale. */
 static void autofit_prep(autofit_t *a, const volatile uint8_t *buf,
-                         int16_t y_top, int16_t y_bot)
+                         int16_t y_top, int16_t y_bot, int8_t mask_ch)
 {
     uint16_t n = (LCD_WIDTH < 512u) ? (uint16_t)LCD_WIDTH : 512u;
     uint8_t mn = 255, mx = 0;
@@ -723,6 +885,11 @@ static void autofit_prep(autofit_t *a, const volatile uint8_t *buf,
         uint8_t sv = buf[x];
         if (sv < mn) mn = sv;
         if (sv > mx) mx = sv;
+    }
+    uint8_t elo, ehi;
+    if (mask_ch >= 0 && scope_mask_extent((uint8_t)mask_ch, &elo, &ehi)) {
+        if (elo < mn) mn = elo;
+        if (ehi > mx) mx = ehi;
     }
     int span = (int)mx - (int)mn;
     if (span < 8) span = 8;                 /* don't zoom pure noise to full band */
@@ -745,32 +912,432 @@ static inline int16_t autofit_y(const autofit_t *a, uint8_t v)
     return (int16_t)yy;
 }
 
-static void draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
-                                 int16_t y_top, int16_t y_bot)
+/*
+ * What the renderer ACTUALLY did to the vertical axis, recorded per band for
+ * the cursor readout.
+ *
+ * The cursor cannot assume the fixed 256/SCOPE_H transform, because the
+ * DEFAULT path is autofit and autofit's pixels-per-count is a property of the
+ * frame that was drawn — it rescales from the record's own min/max, every
+ * frame. Reading the scale off the drawing rather than off an assumption is
+ * the same "one copy, two callers" rule that autofit_prep() itself exists to
+ * enforce; the two-copies version of that bug (full path vs compositor)
+ * already cost this project a week.
+ *
+ * on == false means "nothing was plotted in this band", which the cursor
+ * reports as pixels rather than converting.
+ */
+typedef struct {
+    bool    on;
+    int16_t y_top, y_bot;
+    float   counts_per_pixel;
+    uint8_t channel;            /* 1 or 2 */
+    uint8_t range_idx;
+} vband_t;
+
+static vband_t g_vband[2];
+
+static void vband_clear(void)
+{
+    g_vband[0].on = false;
+    g_vband[1].on = false;
+}
+
+static void vband_note(uint8_t slot, uint8_t channel, uint8_t range_idx,
+                       int16_t y_top, int16_t y_bot, float counts_per_pixel)
+{
+    if (slot > 1u) return;
+    g_vband[slot].on               = (counts_per_pixel > 0.0f);
+    g_vband[slot].y_top            = y_top;
+    g_vband[slot].y_bot            = y_bot;
+    g_vband[slot].counts_per_pixel = counts_per_pixel;
+    g_vband[slot].channel          = channel;
+    g_vband[slot].range_idx        = range_idx;
+}
+
+/* autofit_y() maps counts to pixels with h/span, so its inverse — the number
+ * of ADC counts one screen row is worth in THIS frame — is span/h. */
+static float autofit_counts_per_pixel(const autofit_t *a)
+{
+    if (!a->on || a->h <= 0) return 0.0f;
+    return (float)a->span / (float)a->h;
+}
+
+/*
+ * Where the HARDWARE trigger fires, on the glass.
+ *
+ * The FPGA compares the ADC against reg 0x08 but the record carries ADC - 28,
+ * so the crossing that fires sits at (code - 28) in record units: measured on
+ * ranges 5 and 7 at six levels (EXP-55/56, median 28) and the same constant
+ * as stock's FPGA_ADC_OFFSET. That record code is mapped through the SAME
+ * autofit the trigger-source trace is drawn with, so the line sits on the
+ * trace where NORMAL would fire. Outside the trace's span it clamps to the
+ * band edge (autofit_y's clamp), which on screen reads as "level is above /
+ * below the signal" -- exactly the case where NORMAL holds.
+ *
+ * The code is the one fpga.c records as written (fpga_acq_trig_code_get),
+ * not recomputed from the UI level: report the wire, not the intent.
+ *
+ * Not covered: the opt-in true-scale view (the live compositor ignores it
+ * too); a band with no data falls back to the old pixel convention.
+ */
+static uint16_t scope_soft_trigger_offset(const scope_state_t *ss,
+                                          const volatile uint8_t *src_buf);
+
+static int16_t trigger_marker_y(const scope_state_t *ss, const autofit_t *a)
+{
+    if (a == NULL || !a->on)
+        return (int16_t)(SCOPE_MID_Y - ss->trigger.level);
+    int rec = (int)fpga_acq_trig_code_get() + (int)FPGA_ADC_OFFSET;
+    if (rec < 0)   rec = 0;
+    if (rec > 255) rec = 255;
+    return autofit_y(a, (uint8_t)rec);
+}
+
+/* Full-path variant: rebuild the trigger source's autofit exactly as
+ * draw_demo_waveform() will (same soft-trigger offset, same band split). */
+static int16_t trigger_marker_y_full(const scope_state_t *ss)
+{
+    const volatile uint8_t *b1 = fpga_get_ch1_buf();
+    const volatile uint8_t *b2 = fpga_get_ch2_buf();
+    if (!fpga_data_ready() || b1 == NULL || b2 == NULL)
+        return trigger_marker_y(ss, NULL);
+    const bool src2 = (ss->trigger.source == TRIG_SRC_CH2);
+    const bool c1 = ss->ch1.enabled, c2 = ss->ch2.enabled;
+    const volatile uint8_t *src = src2 ? b2 : b1;
+    uint16_t toff = scope_soft_trigger_offset(ss, src);
+    autofit_t a = { false, 0, 0, 0, 8, 0 };
+    if (c1 && c2)
+        autofit_prep(&a, src + toff, src2 ? (int16_t)(SCOPE_MID_Y + 1) : (int16_t)SCOPE_TOP,
+                                     src2 ? (int16_t)SCOPE_BOT : (int16_t)(SCOPE_MID_Y - 1),
+                     src2 ? 1 : 0);
+    else if (src2 ? c2 : c1)
+        autofit_prep(&a, src + toff, SCOPE_TOP, SCOPE_BOT, src2 ? 1 : 0);
+    return trigger_marker_y(ss, &a);
+}
+
+/*
+ * Mask pass/fail overlay (docs/specs/scope/mask-pass-fail.md).
+ *
+ * The verdict is computed in the acquisition task (scope_mask.c); this only
+ * PAINTS it, per column, from the result already recorded -- no analysis on
+ * the display path. Painted only when the window is on the HARDWARE anchor
+ * (g_trig_anchor == 2: the alignment the mask was taught on) and only for the
+ * frame generation that was actually judged; anything else draws as if there
+ * were no mask, rather than colouring a frame the verdict does not describe.
+ *
+ *   trace   CH1/CH2 trace pixels turn th->warning on columns that were
+ *           outside the mask in that record.
+ *   strip   3 px at the bottom of the live band over the masked span:
+ *           green = passed, red = this column failed, dotted red = the record
+ *           failed elsewhere, dotted amber = refused (SKIP), amber = teaching.
+ */
+static uint8_t  g_trig_anchor = 0;        /* see scope_soft_trigger_offset() */
+static int16_t  g_trig_x_actual = -1;
+static bool     g_mask_ov_on;
+static bool     g_mask_bounds_on;
+static uint32_t g_mask_ov_gen;
+
+static void mask_overlay_begin(void)
+{
+    g_mask_ov_on = (g_trig_anchor == 2u) && g_trig_x_actual >= 0 &&
+                   scope_mask_state() != MASK_PF_EMPTY;
+    /* The bounds depend on the alignment, not on which record was judged,
+     * so they are not gated on the generation: gating them would blink them
+     * off for the frame between a commit and its verdict. */
+    g_mask_bounds_on = g_mask_ov_on && scope_mask_state() == MASK_PF_READY;
+    g_mask_ov_gen = fpga_acq_frame_generation();
+}
+
+/* Mask bounds for screen column x of channel ch, as two y values through the
+ * band's own transform (yfn). Dotted: every other column. */
+#define MASK_BOUND_DOT(x) (((x) & 1u) == 0u)
+
+static inline bool mask_px_fail(int8_t ch, int x)
+{
+    return g_mask_ov_on && ch >= 0 &&
+           scope_mask_column((uint8_t)ch, x, g_trig_x_actual, g_mask_ov_gen) == SCOPE_MASK_COL_FAIL;
+}
+
+/* Strip colour for column x, or 0 for none; *dotted = paint every other px. */
+static uint16_t mask_strip_color(int x, const theme_t *th, bool *dotted)
+{
+    *dotted = false;
+    if (!g_mask_ov_on) return 0;
+    scope_mask_col_t a = scope_mask_column(0, x, g_trig_x_actual, g_mask_ov_gen);
+    scope_mask_col_t b = scope_mask_column(1, x, g_trig_x_actual, g_mask_ov_gen);
+    scope_mask_col_t k = (a > b) ? a : b;        /* enum order = severity */
+    switch (k) {
+    case SCOPE_MASK_COL_PASS:       return th->success;
+    case SCOPE_MASK_COL_FAIL:       return th->warning;
+    case SCOPE_MASK_COL_FAIL_FRAME: *dotted = true; return th->warning;
+    case SCOPE_MASK_COL_SKIP:       *dotted = true; return th->highlight;
+    case SCOPE_MASK_COL_TEACH:      return th->highlight;
+    default:                        return 0;
+    }
+}
+
+#define MASK_STRIP_H 3u
+
+/* Full-path strip (the compositor paints the same rows per pixel). */
+static void draw_mask_strip(const theme_t *th, uint16_t band_bot)
+{
+    if (!g_mask_ov_on) return;
+    for (int x = 0; x < LCD_WIDTH; x++) {
+        bool dotted;
+        uint16_t c = mask_strip_color(x, th, &dotted);
+        if (!c) continue;
+        for (uint16_t y = band_bot - MASK_STRIP_H; y < band_bot; y++)
+            if (!dotted || ((x + y) & 1u) == 0u)
+                lcd_set_pixel((uint16_t)x, y, c);
+    }
+}
+
+/* Returns the ADC counts one screen row was worth in the frame it just drew,
+ * for the cursor readout. */
+static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
+                                  int16_t y_top, int16_t y_bot, int8_t mask_ch)
 {
     uint16_t n = (LCD_WIDTH < 512u) ? (uint16_t)LCD_WIDTH : 512u;
     autofit_t a;
-    autofit_prep(&a, buf, y_top, y_bot);
+    autofit_prep(&a, buf, y_top, y_bot, mask_ch);
 
+    const uint16_t fail_c = theme_get()->warning;
+    const uint16_t bnd_c  = theme_get()->text_secondary;
     int16_t prev_y = -1;
     for (uint16_t x = 0; x < n; x++) {
         int16_t y = autofit_y(&a, buf[x]);
+        uint16_t cc = mask_px_fail(mask_ch, x) ? fail_c : color;
+        uint8_t blo, bhi;
+        if (g_mask_bounds_on && mask_ch >= 0 && MASK_BOUND_DOT(x) &&
+            scope_mask_bound_at((uint8_t)mask_ch, x, g_trig_x_actual, &blo, &bhi)) {
+            lcd_set_pixel(x, (uint16_t)autofit_y(&a, blo), bnd_c);
+            lcd_set_pixel(x, (uint16_t)autofit_y(&a, bhi), bnd_c);
+        }
         if (prev_y >= 0) {                  /* connect prev..cur vertically */
             int16_t a = prev_y < y ? prev_y : y;
             int16_t b = prev_y < y ? y : prev_y;
             for (int16_t v = a; v <= b; v++)
-                lcd_set_pixel(x, (uint16_t)v, color);
+                lcd_set_pixel(x, (uint16_t)v, cc);
         } else {
-            lcd_set_pixel(x, (uint16_t)y, color);
+            lcd_set_pixel(x, (uint16_t)y, cc);
         }
         prev_y = y;
     }
+
+    return autofit_counts_per_pixel(&a);
+}
+
+/* Fixed-scale ("true volts/div") render — the graticule-honesty path (M3).
+ *
+ * Maps sample -> y at a CONSTANT 256/SCOPE_H counts per pixel, the exact
+ * inverse of the geometry the grid and the status bar already assume:
+ * SCOPE_CAL_COUNTS_PER_DIV counts per 26 px division (the _Static_assert below
+ * ties the two together, so they cannot drift). Unlike autofit this does NOT
+ * rescale to the band height, so one division on the glass is worth exactly the
+ * volts/div scope_cal_volts_per_div() prints — that equality is the entire
+ * point.
+ *
+ * The trace is positioned by the real ADC value about `center` (ADC mid-scale,
+ * where `fpga scope center` parks a centred baseline). An uncentred DC offset
+ * therefore shifts the whole trace and can push it past the band; that is the
+ * honest behaviour of a real scope at a fixed volts/div, and it is why this
+ * path is opt-in (scope_state.true_scale, default off) rather than the default.
+ * In split (both-channel) mode the slope still uses the full SCOPE_H, so the
+ * volts/div is identical to single-channel mode and a large signal clips at the
+ * half-band edge exactly as it should. */
+static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
+                                int16_t y_top, int16_t y_bot, uint8_t center,
+                                int8_t mask_ch)
+{
+    uint16_t n = (LCD_WIDTH < 512u) ? (uint16_t)LCD_WIDTH : 512u;
+    int16_t  y_mid = (int16_t)((y_top + y_bot) / 2);
+    const uint16_t fail_c = theme_get()->warning;
+
+    int16_t prev_y = -1;
+    for (uint16_t x = 0; x < n; x++) {
+        int yy = (int)y_mid - ((int)buf[x] - (int)center) * SCOPE_H / 256;
+        if (yy < y_top)   yy = y_top;
+        if (yy >= y_bot)  yy = y_bot - 1;
+        int16_t y = (int16_t)yy;
+        uint16_t cc = mask_px_fail(mask_ch, x) ? fail_c : color;
+        uint8_t blo, bhi;
+        if (g_mask_bounds_on && mask_ch >= 0 && MASK_BOUND_DOT(x) &&
+            scope_mask_bound_at((uint8_t)mask_ch, x, g_trig_x_actual, &blo, &bhi)) {
+            for (int k = 0; k < 2; k++) {          /* same transform as the trace */
+                int by = (int)y_mid - ((int)(k ? bhi : blo) - (int)center) * SCOPE_H / 256;
+                if (by < y_top)  by = y_top;
+                if (by >= y_bot) by = y_bot - 1;
+                lcd_set_pixel(x, (uint16_t)by, theme_get()->text_secondary);
+            }
+        }
+        if (prev_y >= 0) {
+            int16_t a = prev_y < y ? prev_y : y;
+            int16_t b = prev_y < y ? y : prev_y;
+            for (int16_t v = a; v <= b; v++)
+                lcd_set_pixel(x, (uint16_t)v, cc);
+        } else {
+            lcd_set_pixel(x, (uint16_t)y, cc);
+        }
+        prev_y = y;
+    }
+
+    /* The inverse of the slope above, and the one the status bar's volts/div
+     * already assumes. Returned rather than recomputed at the call site so
+     * the cursor can never disagree with the plot. */
+    return 256.0f / (float)SCOPE_H;
+}
+
+/* Software display trigger — the fix for the free-running "dancing" trace.
+ *
+ * Real scopes hold a waveform still by starting every sweep at the same point
+ * on the wave: the moment the signal crosses a chosen level going a chosen
+ * direction. We do that in software here — find that crossing in the trigger
+ * source buffer and return its index, so the render window starts on a
+ * repeatable phase. The offset is applied to BOTH channels so they stay
+ * time-aligned. It never distorts the samples: it only chooses WHERE the drawn
+ * window begins, so amplitude and frequency are untouched.
+ *
+ * 0 = free-run (disabled, NULL buffer, or no crossing found). "No crossing" is
+ * the normal outcome when the level sits outside the signal, and free-running
+ * then is exactly AUTO-mode behaviour.
+ */
+/* Where the trigger point landed on the glass in the last computed window:
+ * column 0..319, or -1 when free-running. g_trig_anchor: 0 none, 1 soft
+ * (midline crossing), 2 hardware (the level crossing nearest index 512 of a
+ * time-ordered record). Read by the position marker and by `spi3 frame`. */
+/* g_trig_x_actual / g_trig_anchor are declared with the mask overlay above
+ * (it reads them); they start at -1 / 0 via scope_soft_trigger_offset(). */
+
+/* The hardware trigger point of a time-ordered record: the crossing of the
+ * level (code - 28, EXP-55/56) in the chosen direction nearest index 512,
+ * within +/-48 (EXP-53: 501..520). Schmitt-armed like the soft trigger.
+ * Returns the index or -1. */
+static int hw_trigger_anchor(const scope_state_t *ss, const volatile uint8_t *buf)
+{
+    /* Moved to trig_edge_anchor() 2026-10-03 so the mask test aligns on the
+     * same crossing the glass does; behaviour unchanged. */
+    int c = (int)fpga_acq_trig_code_get() + (int)FPGA_ADC_OFFSET;
+    return trig_edge_anchor(buf, c, ss->trigger.edge == TRIG_RISING);
+}
+
+static uint16_t scope_soft_trigger_offset(const scope_state_t *ss,
+                                          const volatile uint8_t *src_buf)
+{
+    g_trig_x_actual = -1;
+    g_trig_anchor = 0;
+    if (!ss->soft_trigger || src_buf == NULL)
+        return 0;
+
+    uint16_t draw_n = (LCD_WIDTH < 512u) ? (uint16_t)LCD_WIDTH : 512u;
+    if (FPGA_ADC_BUF_SIZE <= draw_n)
+        return 0;                                 /* no slack to slide */
+    uint16_t max_start = (uint16_t)(FPGA_ADC_BUF_SIZE - draw_n);
+
+    /* Horizontal position: the column the trigger point should land on. */
+    int tx = ss->trig_x;
+    if (tx < 8) tx = 8;
+    if (tx > (int)draw_n - 8) tx = (int)draw_n - 8;
+
+    /* 1. Hardware anchor (2026-09-22): a time-ordered record carries the
+     *    hardware trigger at index 512, and the crossing nearest it IS the
+     *    event that fired. CH1 only -- the level register was measured there.
+     *    Tested on the trigger SOURCE, not the buffer address: `spi3 frame`
+     *    passes a snapshot copy, and an address test made the bench check
+     *    exercise the fallback while the screen used the anchor (v17). */
+    if (ss->trigger.source != TRIG_SRC_CH2 && fpga_acq_record_time_ordered()) {
+        int a = hw_trigger_anchor(ss, src_buf);
+        if (a >= 0) {
+            int start = a - tx;
+            if (start < 0) start = 0;
+            if (start > (int)max_start) start = (int)max_start;
+            g_trig_x_actual = (int16_t)(a - start);
+            g_trig_anchor = 2;
+            return (uint16_t)start;
+        }
+    }
+
+    /* SEAM GUARD (EXP-22, 2026-09-03): the acquisition record is NOT always
+     * time-contiguous at its edges. Saved-frame analysis found ~9-14-sample
+     * phase discontinuities clustered at indices 32..96 (a stale head —
+     * residue roughly one read cadence old, the same defect family as the
+     * "reads are off by one byte" finding) and 864..928. A trigger crossing
+     * fabricated at such a seam locks the trace to an arbitrary phase — at
+     * 500 Hz it showed as frames flipping 180 degrees, ~11-sample p95 jitter,
+     * indistinguishable from free-run. Every frame whose seam fell OUTSIDE
+     * the drawn window locked to <0.1 sample, so the algorithm is sound and
+     * the guard just keeps it off the bad data: start the search at
+     * SEAM_GUARD, which also keeps the window [off, off+draw_n] clear of the
+     * late seams for any signal above ~35 Hz at the slow timebases. The
+     * underlying acquisition defect is filed, not fixed, by this.
+     * The number itself lives in scope_record.h so the spectrum views skip
+     * the same head (2026-09-15). */
+    const uint16_t SEAM_GUARD = SCOPE_RECORD_HEAD_SKIP;
+    if (max_start <= SEAM_GUARD)
+        return 0;
+
+    /* Auto-level: base the threshold at the SIGNAL'S OWN midline, not a fixed
+     * ADC 128. The capture is frequently not centred (e.g. mean 84, range
+     * 34..136 on the bench), so a fixed 128 sits up near the peak where the
+     * slope is shallow and the crossing jitters frame to frame — which reads on
+     * screen as the trace dancing. The 50% level (min+max)/2 is the steep
+     * mid-slope crossing and locks cleanly regardless of DC offset;
+     * trigger.level then shifts it up/down from there (true-scale slope:
+     * SCOPE_H px == 256 counts). Min/max over the guarded region only, so a
+     * seam's glitch cannot skew the threshold either. */
+    uint8_t mn = 255, mx = 0;
+    for (uint16_t i = SEAM_GUARD; i < FPGA_ADC_BUF_SIZE; i++) {
+        uint8_t s = src_buf[i];
+        if (s < mn) mn = s;
+        if (s > mx) mx = s;
+    }
+    if ((int)mx - (int)mn < 8)
+        return 0;                                 /* ~flat: nothing to lock to */
+
+    int thr = ((int)mn + (int)mx) / 2 + ((int)ss->trigger.level * 256) / SCOPE_H;
+    if (thr < (int)mn + 1) thr = (int)mn + 1;     /* keep it inside the signal */
+    if (thr > (int)mx - 1) thr = (int)mx - 1;
+
+    /* 2. Soft anchor: the midline crossing, searched so that the window
+     *    [crossing - tx, crossing - tx + draw_n) stays inside the record and
+     *    clear of the guarded head. */
+    int idx = scope_measure_find_trigger((const uint8_t *)src_buf + SEAM_GUARD + tx,
+                                         (uint16_t)(max_start - SEAM_GUARD),
+                                         (uint8_t)thr,
+                                         ss->trigger.edge == TRIG_RISING, 3u);
+    if (idx <= 0)
+        return 0u;
+    int a = idx + SEAM_GUARD + tx;
+    g_trig_x_actual = (int16_t)tx;
+    g_trig_anchor = 1;
+    return (uint16_t)(a - tx);
+}
+
+int16_t scope_ui_trig_x_actual(void) { return g_trig_x_actual; }
+uint8_t scope_ui_trig_anchor(void)   { return g_trig_anchor; }
+
+/* Exported for bench validation (`spi3 frame`): the offset the renderer would
+ * start the drawn window at for the CURRENT scope state. Exporting the real
+ * function rather than letting the host re-implement it is deliberate — a
+ * host replica passing while the on-screen algorithm fails is exactly the
+ * class of stable-wrong-number this project keeps paying for. */
+uint16_t scope_ui_soft_trigger_offset(const volatile uint8_t *src_buf)
+{
+    return scope_soft_trigger_offset(scope_state_get(), src_buf);
 }
 
 void draw_demo_waveform(uint32_t frame)
 {
     const theme_t *th = theme_get();
     const scope_state_t *ss = scope_state_get();
+
+    /* Forget last frame's vertical scales before anything is drawn. A band
+     * that is not plotted this frame — no capture, channel off, or the demo
+     * waveform below, whose amplitude is decorative — must leave the cursor
+     * with NO transform, so it reports pixels instead of converting through a
+     * scale that belongs to a trace no longer on the screen. */
+    vband_clear();
+    g_mask_ov_on = false;          /* re-armed by mask_overlay_begin() on live data */
 
     /* Freeze waveform when stopped — hold the last running frame */
     static uint32_t frozen_frame = 0;
@@ -801,13 +1368,42 @@ void draw_demo_waveform(uint32_t frame)
          * a single live channel gets the whole area. */
         bool c1 = ss->ch1.enabled && ch1_buf != NULL;
         bool c2 = ss->ch2.enabled && ch2_buf != NULL;
+
+        /* Software trigger: find the phase on the trigger SOURCE channel and
+         * shift both channels' render windows by the same offset, so the trace
+         * stops free-running (dancing) while staying time-aligned. */
+        const volatile uint8_t *trig_src =
+            (ss->trigger.source == TRIG_SRC_CH2 && ch2_buf) ? ch2_buf :
+            (ch1_buf ? ch1_buf : ch2_buf);
+        uint16_t toff = scope_soft_trigger_offset(ss, trig_src);
+        mask_overlay_begin();
+        const volatile uint8_t *b1 = (ch1_buf != NULL) ? ch1_buf + toff : NULL;
+        const volatile uint8_t *b2 = (ch2_buf != NULL) ? ch2_buf + toff : NULL;
+
+        /* True-scale only where the range has a real volts/div; a NONE range
+         * always autofits (its grid has no volts meaning to honour). Default
+         * ss->true_scale == false keeps every build on autofit unless toggled
+         * from the shell. */
+        bool fx1 = ss->true_scale && scope_cal_true_scale_ok(1u, ss->ch1.vdiv_idx);
+        bool fx2 = ss->true_scale && scope_cal_true_scale_ok(2u, ss->ch2.vdiv_idx);
+
+        /* Whatever transform each band ends up drawn with is recorded for the
+         * cursor readout — see vband_note(). */
         if (c1 && c2) {
-            draw_channel_autofit(ch1_buf, th->ch1, SCOPE_TOP, SCOPE_MID_Y - 1);
-            draw_channel_autofit(ch2_buf, th->ch2, SCOPE_MID_Y + 1, SCOPE_BOT);
+            vband_note(0u, 1u, ss->ch1.vdiv_idx, SCOPE_TOP, SCOPE_MID_Y - 1,
+                       fx1 ? draw_channel_fixed(b1, th->ch1, SCOPE_TOP, SCOPE_MID_Y - 1, 128u, 0)
+                           : draw_channel_autofit(b1, th->ch1, SCOPE_TOP, SCOPE_MID_Y - 1, 0));
+            vband_note(1u, 2u, ss->ch2.vdiv_idx, SCOPE_MID_Y + 1, SCOPE_BOT,
+                       fx2 ? draw_channel_fixed(b2, th->ch2, SCOPE_MID_Y + 1, SCOPE_BOT, 128u, 1)
+                           : draw_channel_autofit(b2, th->ch2, SCOPE_MID_Y + 1, SCOPE_BOT, 1));
         } else if (c1) {
-            draw_channel_autofit(ch1_buf, th->ch1, SCOPE_TOP, SCOPE_BOT);
+            vband_note(0u, 1u, ss->ch1.vdiv_idx, SCOPE_TOP, SCOPE_BOT,
+                       fx1 ? draw_channel_fixed(b1, th->ch1, SCOPE_TOP, SCOPE_BOT, 128u, 0)
+                           : draw_channel_autofit(b1, th->ch1, SCOPE_TOP, SCOPE_BOT, 0));
         } else if (c2) {
-            draw_channel_autofit(ch2_buf, th->ch2, SCOPE_TOP, SCOPE_BOT);
+            vband_note(0u, 2u, ss->ch2.vdiv_idx, SCOPE_TOP, SCOPE_BOT,
+                       fx2 ? draw_channel_fixed(b2, th->ch2, SCOPE_TOP, SCOPE_BOT, 128u, 1)
+                           : draw_channel_autofit(b2, th->ch2, SCOPE_TOP, SCOPE_BOT, 1));
         }
         return;
     }
@@ -886,49 +1482,6 @@ void draw_demo_waveform(uint32_t frame)
  * Cursor measurement drawing
  * ═══════════════════════════════════════════════════════════════════ */
 
-static void format_si(float val, const char *unit, char *buf, int bufsize)
-{
-    const char *prefix;
-    float abs_val = val < 0.0f ? -val : val;
-    int pos = 0;
-
-    if (abs_val == 0.0f) {
-        prefix = "";
-    } else if (abs_val >= 1.0f) {
-        prefix = "";
-    } else if (abs_val >= 1.0e-3f) {
-        val *= 1.0e3f;
-        prefix = "m";
-    } else if (abs_val >= 1.0e-6f) {
-        val *= 1.0e6f;
-        prefix = "u";
-    } else {
-        val *= 1.0e9f;
-        prefix = "n";
-    }
-
-    if (val < 0.0f && pos < bufsize - 1) {
-        buf[pos++] = '-';
-        val = -val;
-    }
-
-    int integer = (int)val;
-    int frac = (int)((val - (float)integer) * 100.0f + 0.5f);
-    if (frac >= 100) { integer++; frac -= 100; }
-
-    if (integer >= 1000 && pos < bufsize - 1) buf[pos++] = (char)('0' + (integer / 1000) % 10);
-    if (integer >= 100 && pos < bufsize - 1) buf[pos++] = (char)('0' + (integer / 100) % 10);
-    if (integer >= 10 && pos < bufsize - 1) buf[pos++] = (char)('0' + (integer / 10) % 10);
-    if (pos < bufsize - 1) buf[pos++] = (char)('0' + integer % 10);
-    if (pos < bufsize - 1) buf[pos++] = '.';
-    if (pos < bufsize - 1) buf[pos++] = (char)('0' + frac / 10);
-    if (pos < bufsize - 1) buf[pos++] = (char)('0' + frac % 10);
-
-    while (*prefix && pos < bufsize - 1) buf[pos++] = *prefix++;
-    while (*unit && pos < bufsize - 1) buf[pos++] = *unit++;
-    buf[pos] = '\0';
-}
-
 static void draw_vline_dashed(uint16_t x, uint16_t y_top, uint16_t y_bot,
                               uint16_t color, bool is_active)
 {
@@ -997,22 +1550,31 @@ static void draw_cursors(void)
     /*
      * Delta readout.
      *
-     * Both cursor axes have an EXACT relationship to the capture, because
-     * the waveform plot defines one:
+     * Nothing here converts anything itself. The pixel deltas are turned into
+     * real units by scope_cursor.c, which reads the SAME measured tables the
+     * status bar and the measurement badges read — scope_timebase.c for the
+     * sample rate and scope_cal.c for the per-(channel,range) gain — and
+     * refuses to name a unit when the table has no entry.
      *
-     *   horizontal — draw_demo_waveform()/draw_scope_live_frame() plot
-     *                buf[x] at column x, so one screen column IS one sample.
-     *                dx pixels = dx samples, exactly, no calibration.
-     *   vertical   — the same plots use
-     *                  y = SCOPE_MID_Y - (sample - 128) * SCOPE_H / 256,
-     *                so dy pixels = dy * 256 / SCOPE_H ADC counts, exactly.
+     * What the axes are worth, and why each is exact:
      *
-     * Seconds and volts are a different matter: they need a sample rate and
-     * a per-range gain, neither of which exists yet (dev plan §F2/§F4).
-     * So the readouts are in samples and counts, and the s/V forms appear
-     * only once cursor.time_per_pixel / volts_per_pixel are non-zero — which
-     * scope_state.c documents as "unknown" and sets to 0 until a timebase
-     * and a calibration are wired. That is the whole switch-over.
+     *   horizontal — the plot draws buf[x] at column x, so dx pixels IS dx
+     *                samples (asserted at the top of this file). Seconds need
+     *                the reg-0x01 rate; without one the readout stays in
+     *                samples.
+     *   vertical   — pixels-per-count is whatever the renderer used for the
+     *                band the cursors are in, recorded by vband_note() as it
+     *                draws. It is NOT a constant: autofit, the default path,
+     *                rescales from each record's own min/max. Volts then need
+     *                the range's gain; without one the readout stays in
+     *                counts, and without even a transform it stays in pixels.
+     *
+     * Until 2026-09-12 this read two floats in cursor_state_t that nothing
+     * ever updated: 10 ms across the screen and 8 V down it, seeded once at
+     * init. Every dt and dV the instrument had ever printed came from those
+     * two numbers. They were zeroed in August, which made the readout honest
+     * but left it disconnected from the tables that had just been measured.
+     * The floats are gone; there is no second copy of either constant now.
      */
     uint16_t badge_y = SCOPE_BOT - 28;
     uint16_t badge_x = 4;
@@ -1020,51 +1582,63 @@ static void draw_cursors(void)
     char label[40];
 
     if (c->mode == CURSOR_VERTICAL || c->mode == CURSOR_BOTH) {
-        int16_t dx = (int16_t)c->v2_x - (int16_t)c->v1_x;
-        int16_t adx = (dx < 0) ? (int16_t)-dx : dx;
+        const int32_t dx = (int32_t)c->v2_x - (int32_t)c->v1_x;
 
+        /* ss->timebase_idx IS the reg-0x01 code — the same field the status
+         * bar labels and the Freq badge derive from, so the three cannot
+         * disagree about what rate is in force. */
+        scope_cursor_reading_t dt = scope_cursor_delta_t(ss->timebase_idx, dx);
+        scope_cursor_format(&dt, buf, sizeof(buf));
+        snprintf(label, sizeof(label), "dt=%s", buf);
         lcd_fill_rect(badge_x, badge_y, 100, 13, th->background);
-        if (c->time_per_pixel > 0.0f) {
-            float dt = (float)adx * c->time_per_pixel;
-            format_si(dt, "s", buf, sizeof(buf));
-            snprintf(label, sizeof(label), "dt=%s%s", dx < 0 ? "-" : "", buf);
-        } else {
-            snprintf(label, sizeof(label), "dt=%s%dsmp", dx < 0 ? "-" : "", adx);
-        }
         font_draw_string(badge_x, badge_y, label,
                          th->highlight, th->highlight, &font_small);
 
+        scope_cursor_reading_t f = scope_cursor_one_over_dt(ss->timebase_idx, dx);
+        scope_cursor_format(&f, buf, sizeof(buf));
+        snprintf(label, sizeof(label), "1/dt=%s", buf);
         lcd_fill_rect(badge_x, badge_y + 14, 100, 13, th->background);
-        if (c->time_per_pixel > 0.0f && adx != 0) {
-            float freq = 1.0f / ((float)adx * c->time_per_pixel);
-            format_si(freq, "Hz", buf, sizeof(buf));
-            snprintf(label, sizeof(label), "1/dt=%s", buf);
-        } else {
-            /* No sample rate => no Hz. Saying "1/dt=--" beats printing a
-             * number derived from a placeholder time base. */
-            snprintf(label, sizeof(label), "1/dt=%s", MEAS_NA);
-        }
         font_draw_string(badge_x, badge_y + 14, label,
                          th->highlight, th->highlight, &font_small);
     }
 
     if (c->mode == CURSOR_HORIZONTAL || c->mode == CURSOR_BOTH) {
-        int16_t dy = (int16_t)c->h1_y - (int16_t)c->h2_y;
-        int16_t ady = (dy < 0) ? (int16_t)-dy : dy;
+        /* Second cursor minus first, the same convention dt uses (v2 - v1).
+         * Screen y grows downward while volts grow upward, so H2 minus H1 in
+         * volts is h1_y minus h2_y in pixels. */
+        const int32_t dy = (int32_t)c->h1_y - (int32_t)c->h2_y;
+
+        /*
+         * Only a band that contains BOTH cursors can convert this. In split
+         * (two-channel) mode each band has its own autofit scale, so a delta
+         * spanning the two is not a voltage in either channel — it falls back
+         * to pixels rather than picking one scale and hoping.
+         */
+        scope_cursor_vmap_t vm = { 0.0f, 0u, 0u };
+        for (uint8_t i = 0u; i < 2u; i++) {
+            const vband_t *b = &g_vband[i];
+            if (!b->on) continue;
+            if ((int16_t)c->h1_y < b->y_top || (int16_t)c->h1_y > b->y_bot) continue;
+            if ((int16_t)c->h2_y < b->y_top || (int16_t)c->h2_y > b->y_bot) continue;
+            vm.counts_per_pixel = b->counts_per_pixel;
+            vm.channel          = b->channel;
+            vm.range_idx        = b->range_idx;
+            break;
+        }
+
+        scope_cursor_reading_t dv = scope_cursor_delta_v(&vm, dy);
+        scope_cursor_format(&dv, buf, sizeof(buf));
+
+        /* Name the channel when the number is a voltage: with two channels on
+         * two ranges, "dV=1.20V" alone does not say which frontend measured
+         * it. */
+        if (dv.unit == SCOPE_CURSOR_UNIT_VOLTS)
+            snprintf(label, sizeof(label), "dV%u=%s", vm.channel, buf);
+        else
+            snprintf(label, sizeof(label), "dV=%s", buf);
 
         uint16_t vbadge_x = (c->mode == CURSOR_BOTH) ? 120 : badge_x;
         lcd_fill_rect(vbadge_x, badge_y, 100, 13, th->background);
-        if (c->volts_per_pixel > 0.0f) {
-            float dv = (float)ady * c->volts_per_pixel;
-            format_si(dv, "V", buf, sizeof(buf));
-            snprintf(label, sizeof(label), "dV=%s%s", dy < 0 ? "-" : "", buf);
-        } else {
-            /* Pixels -> counts is the plot's own transform, inverted. */
-            unsigned counts = (unsigned)(((uint32_t)ady * 256u + SCOPE_H / 2u)
-                                         / (uint32_t)SCOPE_H);
-            snprintf(label, sizeof(label), "dV=%s%ucnt",
-                     dy < 0 ? "-" : "", counts);
-        }
         font_draw_string(vbadge_x, badge_y, label,
                          th->highlight, th->highlight, &font_small);
     }
@@ -1481,6 +2055,200 @@ static void draw_scope_debug(const theme_t *th)
 
 #endif /* SCOPE_DEBUG_OVERLAY */
 
+/* ═══════════════════════════════════════════════════════════════════
+ * X-Y (Lissajous) view — CH1 drives X, CH2 drives Y
+ *
+ * Plots the two ADC buffers against each other instead of against time:
+ * op04 (CH1) -> horizontal, op05 (CH2) -> vertical. The buffers come from
+ * one synchronised acquisition and were bench-confirmed time-aligned
+ * (~20 deg phase spread, EXP-21 2026-08-21), so (ch1[i], ch2[i]) is a
+ * single instant and a Lissajous figure renders coherently.
+ *
+ * CH2's readout is a dead buffer until its vertical-offset reference
+ * (TMR13 CH1 PWM-DAC on PA6) is armed — the same thing `trig2 raw` does
+ * from the shell — so this view arms it once on first entry. Square plot
+ * area (side = SCOPE_H) so frequency ratios are not distorted.
+ *
+ * Reads the volatile buffers directly (no tear-check copy): a frame the
+ * acq task is mid-updating just displaces a few points, cosmetically
+ * negligible here. Consecutive samples are connected so the locus reads as
+ * a continuous trace, the way an analog scope draws X-Y.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Bresenham segment written into the persistence buffer (buffer coords). */
+static void xy_line_persist(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    int err = (dx > dy ? dx : -dy) / 2, e2;
+    for (;;) {
+        persist_add_point((uint16_t)x0, (uint16_t)y0);
+        if (x0 == x1 && y0 == y1) break;
+        e2 = err;
+        if (e2 > -dx) { err -= dy; x0 += sx; }
+        if (e2 <  dy) { err += dx; y0 += sy; }
+    }
+}
+
+void draw_xy_screen(void)
+{
+    const theme_t *th = theme_get();
+    const uint16_t side = SCOPE_H;                 /* square side, 206 px */
+    const uint16_t x0   = (LCD_WIDTH - side) / 2;  /* centred: 57 */
+    const uint16_t y0   = SCOPE_TOP;               /* 18 */
+    const uint16_t cx   = x0 + side / 2;
+    const uint16_t cy   = y0 + side / 2;
+
+    /* One-time bring-up: offset DACs (CH1 DAC1 + CH2 TMR13/PA6) and the shared
+     * persistence buffer, borrowed here for the phosphor trail (X-Y and the
+     * time-domain persistence overlay never run at once). */
+    static bool xy_init = false;
+    static int  xy_dac1 = 2048, xy_dac2 = 2048;
+    if (!xy_init) {
+        scope_trigger_dac_init();
+        scope_trigger_ch2_init();
+        scope_trigger_dac_raw((uint16_t)xy_dac1);
+        scope_trigger_ch2_raw((uint16_t)xy_dac2);
+        if (!persist_is_initialized()) persist_init();
+        persist_set_mode(PERSIST_LOW);             /* short phosphor tail */
+        persist_clear();
+        xy_init = true;
+    }
+
+    /* Margins + title: background repaint of the strips either side of the
+     * square (also wipes a prior view on entry). The square is streamed from
+     * the persistence buffer below and never blanks, so there is no flash. */
+    lcd_fill_rect(0, SCOPE_TOP, x0, SCOPE_H, th->background);
+    lcd_fill_rect((uint16_t)(x0 + side), SCOPE_TOP,
+                  (uint16_t)(LCD_WIDTH - (x0 + side)), SCOPE_H, th->background);
+    font_draw_string(4, SCOPE_TOP + 2, "X-Y", th->text_secondary,
+                     th->background, &font_small);
+
+    const volatile uint8_t *xb = fpga_get_ch1_buf();
+    const volatile uint8_t *yb = fpga_get_ch2_buf();
+    bool have = fpga_data_ready() && xb != NULL && yb != NULL
+                && persist_is_initialized();
+
+    /* Snapshot buffers live on the FreeRTOS heap, not in .bss: these 2 KB
+     * put the guest-flavour links over the RAM ceiling (make guest stopped
+     * linking at 352 B over on main alone, before fw_loader's buffers even
+     * joined it — #29). Allocated once, on first X-Y frame with data, and
+     * kept; on this heap (32 KB, ~14 KB measured free) the failure path is
+     * decorative, but it fails to "no snapshot", never to a null deref. */
+    static uint8_t *xy_xs, *xy_ys;
+    if (have && (xy_xs == NULL || xy_ys == NULL)) {
+        if (xy_xs == NULL) xy_xs = pvPortMalloc(FPGA_ADC_BUF_SIZE);
+        if (xy_ys == NULL) xy_ys = pvPortMalloc(FPGA_ADC_BUF_SIZE);
+        if (xy_xs == NULL || xy_ys == NULL) have = false;
+    }
+
+    persist_decay();                     /* fade the whole buffer once per frame */
+
+    if (have) {
+        /* Coherent snapshot (odd generation = acq commit in progress). */
+        uint8_t *const xs = xy_xs;
+        uint8_t *const ys = xy_ys;
+        for (int t = 0; t < 4; t++) {
+            uint32_t g0 = fpga_acq_frame_generation();
+            memcpy(xs, (const void *)xb, FPGA_ADC_BUF_SIZE);
+            memcpy(ys, (const void *)yb, FPGA_ADC_BUF_SIZE);
+            if ((g0 & 1u) == 0u && fpga_acq_frame_generation() == g0)
+                break;
+        }
+
+        uint8_t xmin = 255, xmax = 0, ymin = 255, ymax = 0;
+        for (uint16_t i = 0; i < FPGA_ADC_BUF_SIZE; i++) {
+            if (xs[i] < xmin) xmin = xs[i];
+            if (xs[i] > xmax) xmax = xs[i];
+            if (ys[i] < ymin) ymin = ys[i];
+            if (ys[i] > ymax) ymax = ys[i];
+        }
+        const int xmid_raw = (xmin + xmax) / 2;
+        const int ymid_raw = (ymin + ymax) / 2;
+        int rng_raw = (xmax - xmin) > (ymax - ymin) ? (xmax - xmin) : (ymax - ymin);
+        if (rng_raw < 4) rng_raw = 4;
+
+        /* Smoothed auto-scale: rounded EMA (alpha 1/8) of centre and span. */
+        static int xmid = 128, ymid = 128, rng = 64;
+        static bool seeded = false;
+        if (!seeded) { xmid = xmid_raw; ymid = ymid_raw; rng = rng_raw; seeded = true; }
+        else {
+            xmid += ((xmid_raw - xmid) + (xmid_raw >= xmid ? 4 : -4)) / 8;
+            ymid += ((ymid_raw - ymid) + (ymid_raw >= ymid ? 4 : -4)) / 8;
+            rng  += ((rng_raw  - rng ) + (rng_raw  >= rng  ? 4 : -4)) / 8;
+        }
+        if (rng < 4) rng = 4;
+
+        /* Auto-centre servo on the offset DACs (baseline -> ADC mid-scale). */
+        int e1 = 128 - xmid_raw, e2 = 128 - ymid_raw;
+        if (e1 > 4 || e1 < -4) {
+            xy_dac1 += e1 * 5;
+            if (xy_dac1 < 0) xy_dac1 = 0; else if (xy_dac1 > 4095) xy_dac1 = 4095;
+            scope_trigger_dac_raw((uint16_t)xy_dac1);
+        }
+        if (e2 > 4 || e2 < -4) {
+            xy_dac2 += e2 * 5;
+            if (xy_dac2 < 0) xy_dac2 = 0; else if (xy_dac2 > 4095) xy_dac2 = 4095;
+            scope_trigger_ch2_raw((uint16_t)xy_dac2);
+        }
+
+        /* Plot into the persistence buffer, buffer coords (x 0..319,
+         * y 0..PERSIST_HEIGHT-1 = screen y - SCOPE_TOP). Y inverted. */
+        const int half  = side / 2 - 6;
+        const int chord = side / 3;
+        const int xl = (int)x0, xh = (int)x0 + (int)side - 1;
+        const int yl = 0,       yh = (int)side - 1;
+        const int cyb = (int)cy - (int)SCOPE_TOP;
+        int pbx = 0, pby = 0;
+        for (uint16_t i = 0; i < FPGA_ADC_BUF_SIZE; i++) {
+            int bx = (int)cx + ((int)xs[i] - xmid) * half * 2 / rng;
+            int by = cyb - ((int)ys[i] - ymid) * half * 2 / rng;
+            if (bx < xl) bx = xl; else if (bx > xh) bx = xh;
+            if (by < yl) by = yl; else if (by > yh) by = yh;
+            if (i > 0) {
+                int adx = bx > pbx ? bx - pbx : pbx - bx;
+                int ady = by > pby ? by - pby : pby - by;
+                if (adx < chord && ady < chord)
+                    xy_line_persist(pbx, pby, bx, by);
+                else
+                    persist_add_point((uint16_t)bx, (uint16_t)by);
+            } else {
+                persist_add_point((uint16_t)bx, (uint16_t)by);
+            }
+            pbx = bx; pby = by;
+        }
+    }
+
+    /* Stream the square from the persistence buffer, compositing the centre
+     * axes. Empty pixels -> background, so faded points erase cleanly and the
+     * square is repainted with no blank phase (no flash). */
+    const uint8_t *pb = persist_get_buffer();
+    uint16_t xy_row[SCOPE_H];            /* stack, not BSS — one row of the square */
+    const int cxr = (int)cx - (int)x0;      /* centre col within the square */
+    const int cyr = (int)cy - (int)y0;      /* centre row within the square */
+    for (int ry = 0; ry < (int)side; ry++) {
+        for (int rx = 0; rx < (int)side; rx++) {
+            uint8_t inten = pb ? pb[ry * PERSIST_WIDTH + (int)x0 + rx] : 0;
+            uint16_t c;
+            if (inten)
+                c = persist_intensity_to_color_ch1(inten);
+            else if (rx == cxr || ry == cyr)
+                c = th->grid;
+            else
+                c = th->background;
+            xy_row[rx] = c;
+        }
+        lcd_set_window(x0, (uint16_t)(y0 + ry), side, 1);
+        lcd_write_pixels(xy_row, side);
+    }
+
+    if (!have)
+        font_draw_string_center(LCD_WIDTH / 2, SCOPE_MID_Y, "X-Y: no signal",
+                                th->warning, th->background, &font_small);
+}
+
 void draw_scope_screen(uint32_t frame)
 {
     const theme_t *th = theme_get();
@@ -1499,10 +2267,26 @@ void draw_scope_screen(uint32_t frame)
     draw_ground_markers(ss, th);
 
     /* Layer 4: Trigger level indicator */
-    draw_trigger_indicator(ss, th);
+    draw_trigger_indicator(ss, th, trigger_marker_y_full(ss));
 
     /* Layer 5: Waveform */
     draw_demo_waveform(frame);
+
+    /* Mask strip at the bottom of the live band (the compositor paints the
+     * same rows), only when draw_demo_waveform() armed the overlay. */
+    draw_mask_strip(th, BADGE_ROW2_Y);
+
+    /* Trigger-position marker: a small down-pointing triangle at the top of
+     * the scope area over the column where the trigger point actually landed
+     * (not where it was asked to land -- the fallback may not honour it). */
+    if (g_trig_x_actual >= 0) {
+        for (int r = 0; r < 4; r++)
+            for (int dx = -(3 - r); dx <= 3 - r; dx++) {
+                int x = g_trig_x_actual + dx;
+                if (x >= 0 && x < LCD_WIDTH)
+                    lcd_set_pixel((uint16_t)x, (uint16_t)(SCOPE_TOP + r), th->trigger);
+            }
+    }
 
     /* Layer 6: Math channel overlay */
     draw_math_waveform(frame);
@@ -1588,6 +2372,20 @@ void draw_scope_live_frame(void)
 
     if (!b1 || !b2) return;
 
+    /* Software trigger — THIS is the per-frame live path, so this is where the
+     * free-run "dancing" actually happens. Shift both channels' render window
+     * to the trigger source's crossing, using the same helper and offset as the
+     * full path (draw_demo_waveform) so the two renderers stay in phase. Both
+     * channels shift by the same amount to stay time-aligned. */
+    {
+        const volatile uint8_t *trig_src =
+            (ss->trigger.source == TRIG_SRC_CH2) ? b2 : b1;
+        uint16_t toff = scope_soft_trigger_offset(ss, trig_src);
+        b1 += toff;
+        b2 += toff;
+    }
+    mask_overlay_begin();          /* per-column mask colours, see draw_mask_strip */
+
     /* The live band stops where fixed furniture begins: the debug strip
      * (debug builds) or the measurement badge rows. Those regions repaint
      * themselves; streaming over them would z-fight at frame rate. */
@@ -1602,10 +2400,6 @@ void draw_scope_live_frame(void)
     const uint16_t band_h = band_bot - SCOPE_TOP;
     (void)band_h;
 
-    /* Trigger dotted line, exactly as draw_trigger_indicator places it. */
-    int16_t trig_y = SCOPE_MID_Y - ss->trigger.level;
-    if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
-    if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
 
     /* Autofit exactly as the full path does, including its band split, so a
      * change of renderer never moves the trace. The transform runs against
@@ -1623,13 +2417,20 @@ void draw_scope_live_frame(void)
     autofit_t a1 = { false, 0, 0, 0, 8, 0 };
     autofit_t a2 = { false, 0, 0, 0, 8, 0 };
     if (en1 && en2) {
-        autofit_prep(&a1, b1, SCOPE_TOP, SCOPE_MID_Y - 1);
-        autofit_prep(&a2, b2, SCOPE_MID_Y + 1, SCOPE_BOT);
+        autofit_prep(&a1, b1, SCOPE_TOP, SCOPE_MID_Y - 1, 0);
+        autofit_prep(&a2, b2, SCOPE_MID_Y + 1, SCOPE_BOT, 1);
     } else if (en1) {
-        autofit_prep(&a1, b1, SCOPE_TOP, SCOPE_BOT);
+        autofit_prep(&a1, b1, SCOPE_TOP, SCOPE_BOT, 0);
     } else if (en2) {
-        autofit_prep(&a2, b2, SCOPE_TOP, SCOPE_BOT);
+        autofit_prep(&a2, b2, SCOPE_TOP, SCOPE_BOT, 1);
     }
+
+    /* Trigger dotted line, placed exactly as the full path places it: on the
+     * trigger source's autofit, at the record code where the hardware fires. */
+    int16_t trig_y = trigger_marker_y(ss, (ss->trigger.source == TRIG_SRC_CH2) ? &a2 : &a1);
+    if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
+    if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
+    const uint16_t trig_step = scope_trig_level_focus ? 1u : 3u;   /* dot mask */
 
     int16_t p1 = 0, p2 = 0;  /* previous column's y — vertical continuity */
 
@@ -1659,6 +2460,25 @@ void draw_scope_live_frame(void)
         p1 = y1;
         p2 = y2;
 
+        /* Mask overlay for this column: the strip colour and whether either
+         * trace is painted as outside the mask. */
+        bool     mdot = false;
+        uint16_t mstrip = mask_strip_color((int)x, th, &mdot);
+        uint16_t tc1 = mask_px_fail(0, (int)x) ? th->warning : th->ch1;
+        uint16_t tc2 = mask_px_fail(1, (int)x) ? th->warning : th->ch2;
+        /* Mask bounds (dotted, every other column), through each band's own
+         * autofit -- the one transform, as everywhere else. -1 = none. */
+        int16_t bl1 = -1, bh1 = -1, bl2 = -1, bh2 = -1;
+        if (g_mask_bounds_on && MASK_BOUND_DOT(x)) {
+            uint8_t lo, hi;
+            if (a1.on && scope_mask_bound_at(0, (int)x, g_trig_x_actual, &lo, &hi)) {
+                bl1 = autofit_y(&a1, lo); bh1 = autofit_y(&a1, hi);
+            }
+            if (a2.on && scope_mask_bound_at(1, (int)x, g_trig_x_actual, &lo, &hi)) {
+                bl2 = autofit_y(&a2, lo); bh2 = autofit_y(&a2, hi);
+            }
+        }
+
         /* The popup is a HOLE in the live band, not a layer: its glyphs are
          * the one thing this compositor cannot recompute per pixel, so the
          * column is emitted as up to two segments that step around the box.
@@ -1683,11 +2503,21 @@ void draw_scope_live_frame(void)
             uint16_t c;
             /* Z-order matches the full path: CH2 painted after CH1 there,
              * so CH2 wins here; trace over trigger line over grid. */
-            if (a2.on && (int16_t)y >= lo2 && (int16_t)y <= hi2)
-                c = th->ch2;
+            int mr = (int)y - (int)SCOPE_TOP;          /* trigger-position marker */
+            int mdx = (int)x - (int)g_trig_x_actual; if (mdx < 0) mdx = -mdx;
+            if (g_trig_x_actual >= 0 && mr >= 0 && mr < 4 && mdx <= 3 - mr)
+                c = th->trigger;
+            else if (mstrip && y >= band_bot - MASK_STRIP_H &&
+                     (!mdot || ((x + y) & 1u) == 0u))
+                c = mstrip;
+            else if (a2.on && (int16_t)y >= lo2 && (int16_t)y <= hi2)
+                c = tc2;
             else if (a1.on && (int16_t)y >= lo1 && (int16_t)y <= hi1)
-                c = th->ch1;
-            else if ((int16_t)y == trig_y && (x & 3u) == 0 && x < LCD_WIDTH - 6)
+                c = tc1;
+            else if ((int16_t)y == bl1 || (int16_t)y == bh1 ||
+                     (int16_t)y == bl2 || (int16_t)y == bh2)
+                c = th->text_secondary;
+            else if ((int16_t)y == trig_y && (x & trig_step) == 0 && x < LCD_WIDTH - 6)
                 c = th->trigger;
             else if (y == SCOPE_MID_Y || x == LCD_WIDTH / 2)
                 c = th->grid_center;
@@ -1736,38 +2566,6 @@ void draw_scope_live_frame(void)
 
 #ifdef FEATURE_FFT
 
-static void format_freq(float freq_hz, char *buf, int bufsize)
-{
-    const char *unit;
-    float val;
-
-    if (freq_hz >= 1000000.0f) {
-        val = freq_hz / 1000000.0f;
-        unit = "MHz";
-    } else if (freq_hz >= 1000.0f) {
-        val = freq_hz / 1000.0f;
-        unit = "kHz";
-    } else {
-        val = freq_hz;
-        unit = "Hz";
-    }
-
-    int integer = (int)val;
-    int frac = (int)((val - (float)integer) * 10.0f);
-    if (frac < 0) frac = -frac;
-
-    int pos = 0;
-    if (integer >= 100 && pos < bufsize - 1) buf[pos++] = (char)('0' + integer / 100);
-    if (integer >= 10  && pos < bufsize - 1) buf[pos++] = (char)('0' + (integer / 10) % 10);
-    if (pos < bufsize - 1) buf[pos++] = (char)('0' + integer % 10);
-    if (pos < bufsize - 1) buf[pos++] = '.';
-    if (pos < bufsize - 1) buf[pos++] = (char)('0' + frac);
-
-    while (*unit && pos < bufsize - 1)
-        buf[pos++] = *unit++;
-    buf[pos] = '\0';
-}
-
 /* ── Display reference auto-ranging ─────────────────────────────────
  *
  * fft_process() reports magnitude in dB relative to ONE ADC COUNT
@@ -1810,45 +2608,98 @@ static bool  fft_ref_primed  = false;
  * views did not say so: a user could not tell the spectrum of their probe
  * from the spectrum of a constant compiled into the firmware.
  *
- * Now: the live CH1 record if there is one, the test signal otherwise, and
- * the view is LABELLED with which it got. Same latch discipline as the
- * trace (scope_ui.c fpga_data_ready() gate).
+ * Since then: the live CH1 record if there is one, and the view is LABELLED
+ * with what it got. Same gate as the trace (fpga_data_ready()), same
+ * tear-check as the measurement badges (frame generation counter).
  *
- * Two honest limits, both visible in the labelling rather than hidden:
- *
- *  1. THE FREQUENCY AXIS IS NOT CALIBRATED FOR LIVE DATA. fft_config's
- *     sample_rate_hz is a placeholder (there is no timebase — dev plan §F4),
- *     so bin -> Hz is unknown. The live view therefore reports the peak by
- *     BIN INDEX, which is exact, and never in Hz. The demo view does quote
- *     Hz, and may: the test signal is synthesised at exactly that assumed
- *     rate, so the two agree by construction.
- *  2. The record is 1024 samples into a 4096-point transform. fft_process()
- *     zero-pads, which interpolates the spectrum (fine), but applies the
- *     first quarter of a 4096-point window to it, which is an asymmetric
- *     taper (not fine — it costs sidelobe rejection). Relative magnitudes
- *     stay meaningful; this is a real limitation of analysing a short record
- *     with a long window, and the fix belongs in fft.c, not here.
+ * 2026-09-15 (FFT-live S1):
+ *  - The record's invalid head is skipped (SCOPE_RECORD_HEAD_SKIP, the
+ *    trace's SEAM_GUARD): 896 samples of static body go into the transform,
+ *    windowed over the record rather than over the transform length
+ *    (fft.c FFT_WINDOW_AT).
+ *  - The frequency axis is REAL on measured timebase codes: the rate comes
+ *    from scope_timebase_sample_rate() for the code in force, and is
+ *    refused (0 -> bins, "--") when the code is unmeasured OR when the
+ *    display's code and the FPGA's reg-0x01 code disagree — the same rule
+ *    `fpga scope freq` applies. A confident wrong number is the failure
+ *    mode this project keeps finding; "--" is not.
+ *  - In the live-capture builds (FPGA_WARM_HANDOFF_TEST) the synthetic
+ *    source is compiled OUT: with no capture yet the views say so and draw
+ *    nothing, so the demo signal is unreachable there by construction
+ *    (spec S1). Plain `guest` and `emu` keep the demo, labelled DEMO.
  */
-static bool fft_prepare_input(const fft_config_t *cfg, int16_t *sbuf,
-                              uint16_t *n_out)
+typedef enum {
+    FFT_SRC_NONE = 0,   /* live build, no capture yet: nothing to analyse */
+    FFT_SRC_DEMO,       /* synthetic 1 kHz square at FFT_DEMO_SAMPLE_RATE_HZ */
+    FFT_SRC_LIVE        /* CH1 acquisition record, head skipped */
+} fft_src_t;
+
+#define FFT_DEMO_SAMPLE_RATE_HZ  44100.0f
+
+#if defined(FPGA_WARM_HANDOFF_TEST) && FPGA_WARM_HANDOFF_TEST
+#define FFT_DEMO_REACHABLE 0
+#else
+#define FFT_DEMO_REACHABLE 1
+#endif
+
+/* Sample rate the live spectrum may claim, 0 when it may not. */
+static float fft_live_rate_in_force(void)
+{
+    const scope_state_t *ss = scope_state_get();
+    if (fpga_acq_rate_idx_get() != ss->timebase_idx)
+        return 0.0f;                         /* display and hardware disagree */
+    return scope_timebase_sample_rate(ss->timebase_idx);
+}
+
+static fft_src_t fft_prepare_input(int16_t *sbuf, uint16_t *n_out,
+                                   float *fs_out)
 {
     const volatile uint8_t *b = fpga_get_ch1_buf();
+    *n_out = 0;
+    *fs_out = 0.0f;
 
     if (fpga_data_ready() && b != NULL) {
-        /* Unsigned 8-bit about 128 -> signed, then a fixed <<7 for numeric
-         * headroom in the transform. A constant gain shifts every bin by the
-         * same dB and cannot change the shape of the spectrum. */
-        for (uint16_t i = 0; i < FPGA_ADC_BUF_SIZE; i++)
-            sbuf[i] = (int16_t)(((int16_t)b[i] - 128) * 128);
-        *n_out = FPGA_ADC_BUF_SIZE;
-        return true;
+        uint16_t n = 0;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            uint32_t g0 = fpga_acq_frame_generation();
+            n = fft_live_prepare((const uint8_t *)b, FPGA_ADC_BUF_SIZE,
+                                 sbuf, FFT_SIZE);
+            if ((g0 & 1u) == 0u && fpga_acq_frame_generation() == g0)
+                break;
+        }
+        *fs_out = fft_live_rate_in_force();
+        fft_set_sample_rate(*fs_out);
+        *n_out = n;
+        return FFT_SRC_LIVE;
     }
 
+#if FFT_DEMO_REACHABLE
+    fft_set_sample_rate(FFT_DEMO_SAMPLE_RATE_HZ);
     test_signal_generate(TEST_SIG_SQUARE, sbuf,
-                         FFT_SIZE, cfg->sample_rate_hz,
+                         FFT_SIZE, FFT_DEMO_SAMPLE_RATE_HZ,
                          1000.0f, 0.0f, 0.8f);
+    *fs_out = FFT_DEMO_SAMPLE_RATE_HZ;
     *n_out = FFT_SIZE;
-    return false;
+    return FFT_SRC_DEMO;
+#else
+    return FFT_SRC_NONE;
+#endif
+}
+
+/* Frequency-axis end labels for the visible bin span: hertz on a measured
+ * code, "--" otherwise. Drawn along the bottom edge of the region. */
+static void draw_fft_axis_labels(uint16_t y_bot, float fs,
+                                 uint16_t zoom_start, uint16_t zoom_end)
+{
+    char lbl[12];
+    fft_live_axis_label(fs, FFT_SIZE, zoom_start, lbl, sizeof(lbl));
+    /* Opaque on black: the bars fill the bottom of the region, and grey
+     * transparent text on amber bars was invisible on the bench (FFT-live
+     * S2, 2026-09-22). fg == bg means transparent in font_draw_char(). */
+    font_draw_string(2, y_bot - 10, lbl, COLOR_WHITE, COLOR_BLACK, &font_small);
+    fft_live_axis_label(fs, FFT_SIZE, zoom_end, lbl, sizeof(lbl));
+    font_draw_string_right(LCD_WIDTH - 2, y_bot - 10, lbl,
+                           COLOR_WHITE, COLOR_BLACK, &font_small);
 }
 
 static float fft_display_ref(const fft_config_t *cfg, const float *data,
@@ -1884,7 +2735,14 @@ static void draw_fft_region(uint16_t y_top, uint16_t height)
     int16_t *sbuf = fft_get_sample_buf();
     if (!sbuf) return;  /* FFT not initialized */
     uint16_t nsamp = 0;
-    bool live = fft_prepare_input(cfg, sbuf, &nsamp);
+    float fs = 0.0f;
+    fft_src_t src = fft_prepare_input(sbuf, &nsamp, &fs);
+    if (src == FFT_SRC_NONE || nsamp == 0) {
+        font_draw_string(4, y_top + 2, "FFT: waiting for capture",
+                         COLOR_GRAY, COLOR_GRAY, &font_small);
+        return;
+    }
+    bool live = (src == FFT_SRC_LIVE);
     fft_process(sbuf, nsamp, &fft_result);
 
     const float *draw_data = (fft_result.avg_db != NULL)
@@ -1953,7 +2811,7 @@ static void draw_fft_region(uint16_t y_top, uint16_t height)
                 if (db_int >= 10)  label[pos++] = (char)('0' + (db_int / 10) % 10);
                 label[pos++] = (char)('0' + db_int % 10);
                 label[pos] = '\0';
-                font_draw_string(2, y - 5, label, COLOR_GRAY, COLOR_GRAY, &font_small);
+                font_draw_string(2, y - 5, label, COLOR_GRAY, COLOR_BLACK, &font_small);  /* opaque: see draw_fft_axis_labels */
             }
         }
     }
@@ -1981,37 +2839,42 @@ static void draw_fft_region(uint16_t y_top, uint16_t height)
          * unlike an absolute Hz figure, which is why one is drawn here and
          * the other is not. */
         if (fft_result.peaks[p].label[0] != '\0' && peak_x > 8 && peak_x < LCD_WIDTH - 30) {
-            font_draw_string(peak_x - 8, peak_y - 12,
+            /* Keep the tag below the source/peak header, which occupies
+             * y_top + 2 .. y_top + 2 + font height. The tallest peak reaches
+             * the headroom line just under the header, so its tag sat on top
+             * of "LIVE CH1 pk ..." on the bench (2026-09-22). */
+            int16_t tag_y = (int16_t)peak_y - 12;
+            int16_t tag_min = (int16_t)y_top + 2 + (int16_t)font_small.height + 1;
+            if (tag_y < tag_min) tag_y = tag_min;
+            font_draw_string(peak_x - 8, (uint16_t)tag_y,
                              fft_result.peaks[p].label, COLOR_ORANGE, COLOR_ORANGE, &font_small);
         }
     }
 
-    /* Source + peak header. The peak is quoted in Hz ONLY for the synthetic
-     * signal, where the sample rate is the one it was generated at; for live
-     * capture it is quoted as a bin index, which needs no rate to be true. */
+    /* Source + peak header. The peak is quoted in Hz only when the sample
+     * rate is known — the demo signal's by construction, the live record's
+     * when the timebase code in force is a measured one (fft_live_axis_known).
+     * Otherwise it is quoted as a bin index, which needs no rate to be true. */
     {
-        char hdr[28];
-        uint16_t color;
-        if (live) {
-            color = COLOR_WHITE;
-            if (fft_result.num_peaks > 0)
-                snprintf(hdr, sizeof(hdr), "LIVE CH1  pk bin %u",
-                         (unsigned)fft_result.peaks[0].bin);
-            else
-                snprintf(hdr, sizeof(hdr), "LIVE CH1");
+        char hdr[40];
+        char freq_str[16];
+        uint16_t color = live ? COLOR_WHITE : COLOR_ORANGE;
+        const char *tag = live ? "LIVE CH1" : "DEMO sq";
+        if (fft_result.num_peaks == 0) {
+            snprintf(hdr, sizeof(hdr), "%s", live ? "LIVE CH1" : "DEMO SIGNAL");
+        } else if (fft_live_axis_known(fs)) {
+            fft_live_format_hz(fft_result.peaks[0].freq_hz, freq_str,
+                               sizeof(freq_str));
+            snprintf(hdr, sizeof(hdr), "%s  pk %s", tag, freq_str);
         } else {
-            char freq_str[16];
-            color = COLOR_ORANGE;
-            if (fft_result.num_peaks > 0) {
-                format_freq(fft_result.peaks[0].freq_hz, freq_str,
-                            sizeof(freq_str));
-                snprintf(hdr, sizeof(hdr), "DEMO sq  pk %s", freq_str);
-            } else {
-                snprintf(hdr, sizeof(hdr), "DEMO SIGNAL");
-            }
+            snprintf(hdr, sizeof(hdr), "%s  pk bin %u  --", tag,
+                     (unsigned)fft_result.peaks[0].bin);
         }
         font_draw_string(4, y_top + 2, hdr, color, color, &font_small);
     }
+
+    if (height > 80)
+        draw_fft_axis_labels(y_bot, fs, zoom_start, zoom_end);
 
     const char *win_names[] = { "Rect", "Hann", "Hamm", "BHar", "Flat" };
     const char *win_name = (cfg->window < FFT_WINDOW_COUNT)
@@ -2049,9 +2912,10 @@ void draw_split_screen(uint32_t frame)
 
     if (trace_live) {
         uint16_t band_h = (uint16_t)(scope_bot - scope_top);
-        for (x = 0; x < LCD_WIDTH && x < FPGA_ADC_BUF_SIZE; x++) {
+        /* Start past the invalid head (scope_record.h), like the trace. */
+        for (x = 0; x < LCD_WIDTH && x + SCOPE_RECORD_HEAD_SKIP < FPGA_ADC_BUF_SIZE; x++) {
             int16_t wy = (int16_t)scope_mid -
-                         (int16_t)(((int16_t)b1[x] - 128) * band_h / 256);
+                         (int16_t)(((int16_t)b1[x + SCOPE_RECORD_HEAD_SKIP] - 128) * band_h / 256);
             if (wy >= (int16_t)scope_top && wy < (int16_t)scope_bot)
                 lcd_set_pixel(x, (uint16_t)wy, COLOR_CH1);
         }
@@ -2141,7 +3005,15 @@ void draw_waterfall_screen(void)
     int16_t *sbuf = fft_get_sample_buf();
     if (!sbuf) return;  /* FFT not initialized */
     uint16_t nsamp = 0;
-    bool live = fft_prepare_input(cfg, sbuf, &nsamp);
+    float fs = 0.0f;
+    fft_src_t src = fft_prepare_input(sbuf, &nsamp, &fs);
+    if (src == FFT_SRC_NONE || nsamp == 0) {
+        lcd_fill_rect(0, SCOPE_TOP, LCD_WIDTH, SCOPE_H, COLOR_BLACK);
+        font_draw_string(4, SCOPE_TOP + 2, "WFALL: waiting for capture",
+                         COLOR_GRAY, COLOR_GRAY, &font_small);
+        return;
+    }
+    bool live = (src == FFT_SRC_LIVE);
     fft_process(sbuf, nsamp, &fft_result);
 
     /* Resolve the history buffer out of the FFT's pool tenancy. Returns NULL
@@ -2269,6 +3141,7 @@ void draw_waterfall_screen(void)
     else
         font_draw_string(4, SCOPE_TOP + 2, "WFALL DEMO SIGNAL",
                          COLOR_ORANGE, COLOR_ORANGE, &font_small);
+    draw_fft_axis_labels(SCOPE_TOP + SCOPE_H, fs, zoom_start, zoom_end);
 }
 
 #endif /* FEATURE_FFT */

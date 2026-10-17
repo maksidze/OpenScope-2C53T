@@ -75,6 +75,7 @@ typedef enum {
     SCOPE_VIEW_FFT,
     SCOPE_VIEW_SPLIT,
     SCOPE_VIEW_WATERFALL,
+    SCOPE_VIEW_XY,          /* Lissajous: CH1 -> X, CH2 -> Y */
     SCOPE_VIEW_COUNT
 } scope_view_t;
 #endif
@@ -126,23 +127,51 @@ extern volatile bool          persist_enabled;
 #define SETTINGS_OSC_ITEM_COUNT 8
 #define SETTINGS_ABOUT_LINES    5
 #define METER_SUBMODE_COUNT     11
-#define METER_LAYOUT_COUNT      4
-#define METER_LAYOUT_FULL       0
-#define METER_LAYOUT_CHART      1
+/* Meter views (softkey UI, 2026-10-06), cycled by the View softkey (PRM):
+ * Big -> Graph -> Stats -> Limits -> Fuse. Numbering keeps saved settings
+ * meaningful: 0 was "Full", now the big reading that replaced it. */
+#define METER_LAYOUT_COUNT      5
+#define METER_LAYOUT_BIG        0
+#define METER_LAYOUT_FULL       METER_LAYOUT_BIG   /* old name */
+#define METER_LAYOUT_CHART      1   /* "Graph" */
 #define METER_LAYOUT_STATS      2
 #define METER_LAYOUT_FUSE       3
+#define METER_LAYOUT_LIMITS     4   /* pass/fail against Low/High */
 
 /* Fuse tester sub-views (cycled with SELECT in fuse layout) */
-#define FUSE_VIEW_DETAIL        0   /* Single fuse: current + V_drop + R + bar */
-#define FUSE_VIEW_MULTI         1   /* All ratings for selected type */
-#define FUSE_VIEW_SCAN          2   /* Pass/fail parasitic draw hunting */
-#define FUSE_VIEW_COUNT         3
+#define FUSE_VIEW_DETAIL        0   /* Single fuse: picture, current, bar, drop, R */
+#define FUSE_VIEW_MULTI         1   /* "Table": all ratings of the type */
+#define FUSE_VIEW_SCAN          2   /* DRAW / NO DRAW for walking a fuse box */
+#define FUSE_VIEW_TYPES         3   /* "Which fuse is this?" reference page */
+#define FUSE_VIEW_COUNT         4
 
 #ifdef FEATURE_FFT
 #include "fft.h"
 #include "fft_test_signals.h"
 #include "shared_mem.h"   /* waterfall history is a sub-tenant of the FFT pool region */
 extern volatile scope_view_t scope_view;
+
+/* Scope time view: what UP/DOWN adjust. false = volts/div of the active
+ * channel (the default), true = the hardware trigger level. Toggled by MOVE
+ * (2026-09-22). Read by the renderer to highlight the level marker. */
+extern volatile bool scope_trig_level_focus;
+
+/* Scope time view: LEFT/RIGHT move the trigger point on screen instead of
+ * changing the timebase. MOVE cycles V/div -> Trig level -> Position. */
+extern volatile bool scope_hpos_focus;
+/* MOVE's fourth stage (mask tolerance), only while a mask exists. */
+extern volatile bool scope_mask_focus;
+/* Post a button press into the input queue (shell `btn`). */
+bool input_inject_button(button_id_t b);
+
+/* Where the trigger point landed in the last drawn window (column, -1 = free
+ * run) and how it was found (0 none, 1 soft midline, 2 hardware level
+ * crossing of a time-ordered record). */
+int16_t scope_ui_trig_x_actual(void);
+/* Repaint the mask pass/fail readout slot (badge row 2) -- main.c calls it
+ * when scope_mask_epoch() moves. */
+void scope_ui_mask_slot_refresh(void);
+uint8_t scope_ui_trig_anchor(void);
 extern fft_result_t     fft_result;
 #endif
 
@@ -165,6 +194,16 @@ void draw_scope_live_frame(void);  /* flicker-free trace-band update; falls
                                       cursors (see main.c scope branch) */
 void scope_show_popup(const char *text);
 bool scope_popup_active(void);
+/* Popups raised outside the scope (softkey UI P0). The display task calls
+ * this every loop in non-scope modes: 0 = nothing to do, 1 = drew the box,
+ * 2 = it just expired -- repaint the screen underneath. */
+int  ui_popup_overlay_service(bool screen_repainted);
+void ui_popup_overlay_cancel(void);
+
+/* The renderer's software display trigger, exported for bench validation
+ * (`spi3 frame`): index the drawn window starts at for the CURRENT scope
+ * state; 0 = free-run (disabled / flat signal / no crossing). */
+uint16_t scope_ui_soft_trigger_offset(const volatile uint8_t *src_buf);
 
 /* Advance the quick-change popup on the flicker-free render path, painting the
  * box once on the frame it first appears. draw_scope_live_frame() steps the
@@ -176,6 +215,7 @@ void scope_popup_overlay_tick(void);
 void draw_fft_screen(void);
 void draw_split_screen(uint32_t frame);
 void draw_waterfall_screen(void);
+void draw_xy_screen(void);
 #endif
 
 /* meter_ui.c */
@@ -185,10 +225,27 @@ bool meter_screen_needs_periodic_redraw(void);
 void meter_reset_minmaxavg(void);
 void meter_toggle_relative(void);
 void meter_toggle_hold(void);
+/* Softkey UI (docs/specs/platform/softkey-ui.md) */
+void     meter_hold_toggle_now(void);     /* OK: freeze the shown reading / back to live */
+void     meter_hold_release(void);
+bool     meter_hold_is_on(void);
+void     meter_function_step(int8_t dir); /* next/previous function (MOVE, LEFT/RIGHT) */
+void     meter_limits_nudge(int8_t dir);  /* UP/DOWN in the Limits view */
+bool     meter_softkey_press(int8_t slot);
+void     meter_softkeys_draw(void);
+uint32_t meter_softkeys_epoch(void);
+float    meter_continuity_threshold(void);   /* continuity beeps below this (Ohm) */
 void meter_toggle_debug_overlay(void);
 
 /* fuse_ui.c */
-void draw_fuse_screen(float voltage_drop_mv);
+/* drop_decimals: -1 = no DC-volts reading yet, -2 = the meter is on another
+ * function (settings can restore Fuse view with one); steady = the reading
+ * has settled (no verdict until it has: open leads wander, F47); repaint =
+ * the meter just cleared the screen. drop_mv already has the lead cal taken
+ * off. */
+void draw_fuse_screen(float drop_mv, int8_t drop_decimals, bool steady, bool repaint);
+void fuse_rating_press(void);
+void fuse_threshold_press(void);
 void fuse_cycle_view(void);
 void fuse_next_rating(void);
 void fuse_prev_rating(void);

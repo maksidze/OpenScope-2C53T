@@ -43,12 +43,38 @@ V/div steps: 5mV, 10mV, 20mV, 50mV, 100mV, 200mV, 500mV, 1V, 2V, 5V
 
 Timebase steps: 5ns, 10ns, 20ns, 50ns, 100ns, 200ns, 500ns, 1us, 2us, 5us, 10us, 20us, 50us, 100us, 200us, 500us, 1ms, 2ms, 5ms, 10ms, 20ms
 
-### Trigger
+### Trigger and MOVE
+
+**MOVE** cycles what the arrow keys adjust (a popup names the stage):
+
+| Stage | UP/DOWN | LEFT/RIGHT | SELECT |
+|-------|---------|------------|--------|
+| V/div (default) | V/div of the active channel | Timebase | Probe 1X/10X |
+| Trig level | Trigger level (the dotted line) | Timebase | Probe 1X/10X |
+| Position | V/div | Trigger point across the screen | Probe 1X/10X |
+| Mask (only while a mask exists) | Mask vertical tolerance ±2 counts | Mask horizontal tolerance ±1 sample | Stop-on-fail on/off |
+
+The trigger edge (Rising/Falling) is in Settings -> Oscilloscope Settings.
+(Until 2026-09-22 this table said MOVE cycled the edge; it has not done so
+since the trigger-level control landed.)
 
 | Button | Action |
 |--------|--------|
-| **MOVE** | Cycle trigger edge (Rising -> Falling) |
-| **OK** | Toggle Run / Stop |
+| **OK** | Toggle Run / Stop (or, while a mask failure is held, resume testing) |
+
+### Mask pass/fail (time view)
+
+| Button | Action |
+|--------|--------|
+| **AUTO** | No mask: teach one from the next 8 good captures. Teaching: cancel. Mask ready: turn it off |
+| **MOVE** -> *Mask* | Adjust tolerances and stop-on-fail (table above) |
+| **OK** | Resume after a held failure |
+
+Every capture is then judged PASS / FAIL, or skipped with a reason (for example,
+a setting changed since teaching). Dotted lines show the mask. Columns that
+broke it turn red, and a strip along the bottom shows the verdict. The badge
+row shows `P<n> F<n>`, `MASK skip: <why>`, or `FAIL ... HOLD-OK` while a
+failure is held. Full design: `docs/specs/scope/mask-pass-fail.md`.
 
 ### Cursors
 
@@ -68,7 +94,7 @@ When cursors are active, UP/DOWN/LEFT/RIGHT control cursors instead of V/div and
 | **SELECT** | Cycle FFT window function (in FFT/Split/Waterfall views) |
 | **UP/DOWN** | Adjust reference level (+/- 5dB, in FFT views) |
 | **LEFT/RIGHT** | Zoom in/out frequency range (in FFT views) |
-| **AUTO** | Auto-configure FFT (generate test signal + optimize) |
+| **AUTO** | Auto-configure FFT (in FFT views; in the time view AUTO is the mask key) |
 
 Note: Entering an FFT view claims the shared memory pool (88KB). Returning to time view releases it.
 
@@ -82,33 +108,69 @@ Note: Entering an FFT view claims the shared memory pool (88KB). Returning to ti
 
 ## Multimeter Mode
 
-### Sub-mode Navigation
+The four buttons directly under the screen are **softkeys**: the bar along the
+bottom edge of the screen says what each one does, right above it, and its
+current value. Softkeys arrived with the softkey UI (2026-10-06; spec
+`docs/specs/platform/softkey-ui.md`).
+
+### Softkeys
+
+| Button | Big / Graph / Stats | Limits | Fuse |
+|--------|---------------------|--------|------|
+| **MOVE** | **Function**: next function | Function | **Cal leads**: hold the tips together and press, to take the lead offset off every reading. On the Types page: **Fuse type** |
+| **SELECT** | **Reset**: min/max/avg, chart, histogram | **Low**: arrows move it; press again = set to the reading | **Rating** (next, wrapping; arrows step). In Scan: **Draw if >** presets 0.1 / 0.2 / 0.5 / 1 / 2 mV |
+| **TRIGGER** | **Relative** on/off (zeros at the current reading). In Continuity: **Beep** threshold 10 / 30 / 50 / 100 Ohm | **High**, likewise | **Show**: Detail -> Table -> Scan -> Types |
+| **PRM** | **View**: Big -> Graph -> Stats -> Limits -> Fuse | View | View |
+
+### Other buttons
 
 | Button | Action |
 |--------|--------|
-| **LEFT** | Previous meter sub-mode |
-| **RIGHT** | Next meter sub-mode |
-| **OK** | Cycle layout: Full -> Chart -> Stats -> Full |
-| **AUTO** | Toggle relative/delta mode (REL) — zeros at current reading, shows deviation |
-| **TRIGGER** | Toggle auto-hold (HOLD) — freezes display when reading stabilizes |
-| **SELECT** | Reset min/max/avg tracking (also resets chart and histogram) |
+| **OK** | **Hold**: freeze the reading on screen now (HOLD badge); OK again = live |
+| **LEFT / RIGHT** | Previous / next function (Fuse view: fuse type) |
+| **UP / DOWN** | Limits view: move the highlighted limit. Fuse view: rating up/down (Scan: threshold ±0.1 mV) |
+| **AUTO** | Automatic function select (DC V / AC V) |
+| **SAVE** | Raw-frame debug overlay |
 
-### 11 Sub-modes
+Changing function is instant: the reading shows dashes while the meter chip
+switches in the background (~1.5 s in the `-meter` image). In the plain
+`coldtrace` image only DC volts is measured; other functions show `---`.
+
+### 11 Functions
 
 ```
 0: DC Voltage       6: Resistance
-1: AC Voltage       7: Continuity
+1: AC Voltage       7: Continuity  (short = below the Beep threshold, default 30 Ohm)
 2: DC Current (mA)  8: Diode Test
 3: DC Current (A)   9: Capacitance
 4: AC Current (mA) 10: Temperature
 5: AC Current (A)
 ```
 
-### 3 Display Layouts
+### 5 Views
 
-- **Full** — Large digits, bar graph, min/max/avg, range info. Classic DMM.
-- **Chart** — Compact reading on top, scrolling strip chart below with auto-scaling Y axis. Shows measurement trend over time.
-- **Stats** — Compact reading, min/max/avg/peak-to-peak statistics, and histogram of reading distribution.
+- **Big** — the reading in 70 px digits, unit underneath, one line of min/max (or the relative reference, or SHORT/OPEN). Readable across the bench.
+- **Graph** — compact reading, scrolling strip chart with an auto-scaled Y axis.
+- **Stats** — min/max/avg/peak-to-peak and a histogram of the readings.
+- **Limits** — pass/fail: a big PASS / FAIL box, the reading's position on a Low–High bar, pass and fail counts, and the last failing value. Entering it with a live reading sets Low/High to the reading ±5 %.
+- **Fuse** — fuse current tester: probe the two metal tips on top of a fuse
+  left in place, and it estimates the current from the voltage drop and the
+  fuse's typical resistance (about ±10 %). Entering it switches to DC V.
+  **Calibrate the leads first:** touch the probe tips together and press
+  **Cal leads**. The meter reads about −1 mV with nothing connected, which
+  would otherwise show as a ~120 mA draw on a 10 A fuse. The value is kept
+  until power-off. No verdict is shown until the reading has been steady for
+  about a second ("unsteady: probes on?", or WAIT in Scan).
+  - **Detail**: a picture of the selected fuse, the current, a 0–150 mA bar
+    with the 50 mA parasitic-draw mark, the drop and the fuse resistance.
+  - **Table**: every rating of the type, largest at the top, with the current
+    each would mean.
+  - **Scan**: DRAW / NO DRAW against the threshold, for walking a fuse box
+    with the engine off, plus the current if the fuse is 10/15/20/30 A
+    (20/30/40/60 A for Maxi and J-Case).
+  - **Types**: "which fuse is this?" — the five types to scale, front and top,
+    and the common rating colours. The number on top of the fuse is what
+    counts; colours vary.
 
 ---
 
@@ -246,15 +308,15 @@ Shows device info, pool status, heap free, license. **MENU** or **OK** to go bac
 | CH2    | Coupling DC/AC   |        -         |        -         |        -         |
 | UP     | V/div up         |        -         | Amplitude up     | Selection up     |
 | DOWN   | V/div down       |        -         | Amplitude down   | Selection down   |
-| LEFT   | Timebase down    | Prev sub-mode    | Duty cycle down  |        -         |
-| RIGHT  | Timebase up      | Next sub-mode    | Duty cycle up    |        -         |
-| OK     | Run/Stop         | Cycle layout     | Output on/off    | Enter / Toggle   |
-| PRM    | Cycle FFT views  |        -         | Freq presets     |        -         |
-| SELECT | Probe 1X/10X     | Reset min/max    | Cycle waveform   | Cycle comp type  |
-| MOVE   | Trigger edge     |        -         |        -         |        -         |
-| TRIGGER| Cursor mode      | Toggle HOLD      |        -         |        -         |
-| AUTO   | FFT auto-config  | Toggle REL       |        -         |        -         |
-| SAVE   | Screenshot       | Screenshot       | Screenshot       | Screenshot       |
+| LEFT   | Timebase down    | Prev function    | Duty cycle down  |        -         |
+| RIGHT  | Timebase up      | Next function    | Duty cycle up    |        -         |
+| OK     | Run/Stop         | Hold             | Output on/off    | Enter / Toggle   |
+| PRM    | Cycle FFT views  | Softkey: View    | Freq presets     |        -         |
+| SELECT | Probe 1X/10X     | Softkey (Reset)  | Cycle waveform   | Cycle comp type  |
+| MOVE   | Trigger edge     | Softkey (Func.)  |        -         |        -         |
+| TRIGGER| Cursor mode      | Softkey (Rel.)   |        -         |        -         |
+| AUTO   | FFT auto-config  | Auto function    |        -         |        -         |
+| SAVE   | Screenshot       | Debug overlay    | Screenshot       | Screenshot       |
 +--------+------------------+------------------+------------------+------------------+
 
 Note: When cursors are active in Oscilloscope mode, UP/DOWN moves the cursor

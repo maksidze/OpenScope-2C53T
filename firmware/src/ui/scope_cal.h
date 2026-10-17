@@ -116,11 +116,32 @@ extern "C" {
 
 /*
  * Correction for the calibration source's true-vs-commanded amplitude.
- * 1.0f = "we are taking the ESP32 siggen at its word", which is the current
- * state and is NOT a verified claim. See the header comment above before
- * changing this, and change ONLY this rather than individual table rows.
+ *
+ * 0.92f, measured against a JDS6600 (crystal-referenced, ~1-2% amplitude
+ * accuracy) — the raw table above was taken through the ESP32 siggen, which
+ * over-reads gain ~8%, so every reported voltage at 1.0f was ~8% high.
+ *
+ * Provenance (two sessions, one-source-into-both, timebase 0x10, centered,
+ * slope fit of span vs commanded Vpp):
+ *   - EXP-20 (2026-08-21): CH1 r6 0.919, r7 0.884, DC r7 0.874.
+ *   - EXP-21 (2026-08-28): JDS *CH1* driven into BOTH scope inputs in turn.
+ *       raw slopes r6: CH1 25.2, CH2 25.3 cts/Vpp — identical to 0.4%, so the
+ *       two frontends respond the same and ONE shared scale is correct; the
+ *       earlier apparent ~5% CH1/CH2 gap was the generator's own channel
+ *       mismatch, not the device. Per-channel SCALE r6 0.924 / 0.948,
+ *       r5 0.943 / 0.966.
+ * CH1 r6 reproduced across the two sessions to 0.5% (0.919 vs 0.924). The
+ * grand center across ranges is ~0.92; the ~0.874-0.966 spread is within the
+ * source's amplitude accuracy plus a mild range trend, and a single constant
+ * cannot fully reconcile the stored table's own CH1-vs-CH2 row inconsistency
+ * (42.95 vs 41.71 at r6, ~3%). Correcting a measured, reproduced ~8% error
+ * with a constant good to ~2% is strictly better than leaving it uncorrected.
+ *
+ * Absolute scale is still limited by the JDS's amplitude accuracy; a
+ * lab-grade source would refine (not overturn) this. See the header comment
+ * above before changing, and change ONLY this rather than individual rows.
  */
-#define SCOPE_CAL_SOURCE_SCALE     1.0f
+#define SCOPE_CAL_SOURCE_SCALE     0.92f
 
 typedef enum {
     SCOPE_CAL_NONE = 0,     /* unusable range — caller must show ADC counts */
@@ -136,11 +157,37 @@ typedef enum {
  */
 float scope_cal_mv_per_count(uint8_t ch, uint8_t range_idx);
 
-/* Volts per ADC count — the form the measurement badges want. 0.0f as above. */
+/* Volts per ADC count AT THE PROBE TIP — the form the badges, cursor and
+ * volts/div labels want. = mV/count x the channel's probe factor / 1000.
+ * 0.0f as above. scope_cal_mv_per_count() above stays BNC-referred: it is the
+ * calibration table (what `fpga scope cal` prints and the bench scripts
+ * verify), and a probe setting must never look like a calibration change. */
 float scope_cal_volts_per_count(uint8_t ch, uint8_t range_idx);
+
+/* Probe attenuation, read through a registered source so the probe setting
+ * has ONE home (scope_state) and ONE application point (here). Until
+ * 2026-10-03 the 1X/10X setting reached nothing but an unobeyed USART bit:
+ * a user on a 10x probe saw volts 10x too small. No source registered (host
+ * tests, early boot) or a factor <= 0 means 1.0. */
+typedef float (*scope_cal_probe_fn)(uint8_t ch);
+void  scope_cal_set_probe_source(scope_cal_probe_fn fn);
+float scope_cal_probe_factor(uint8_t ch);
 
 /* How much to trust the above. */
 scope_cal_tier_t scope_cal_get_tier(uint8_t ch, uint8_t range_idx);
+
+/*
+ * May the renderer draw this (channel, range) at TRUE vertical scale — i.e.
+ * make one grid division mean exactly scope_cal_volts_per_div()?
+ *
+ * True-scale rendering fixes the sample->pixel slope at SCOPE_CAL_COUNTS_PER_DIV
+ * counts per division; that is only honest when a volts/div actually exists for
+ * the range. This returns nonzero exactly when it does (MEASURED or
+ * PROVISIONAL). On a NONE range it returns 0 and the renderer MUST fall back to
+ * its own-min/max autofit, whose graticule has no volts meaning — the same
+ * counts-vs-volts contract every other consumer of this module honours.
+ */
+int scope_cal_true_scale_ok(uint8_t ch, uint8_t range_idx);
 
 /*
  * Volts per screen division, derived from the measured gain and the
@@ -162,6 +209,11 @@ float scope_cal_volts_per_div(uint8_t ch, uint8_t range_idx);
  * the same class of defect as an invented measurement.
  */
 void scope_cal_range_label(uint8_t ch, uint8_t range_idx, char *out, uint32_t n);
+
+/* The same label at the BNC, ignoring the probe factor: for the calibration
+ * dump (`fpga scope cal`), whose table must not change with a UI setting
+ * (EXP-70 addendum: the first probe build moved that column). */
+void scope_cal_range_label_bnc(uint8_t ch, uint8_t range_idx, char *out, uint32_t n);
 
 #ifdef __cplusplus
 }

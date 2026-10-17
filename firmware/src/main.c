@@ -25,6 +25,7 @@ extern void system_clock_config(void);
 #include "signal_gen.h"
 #include "watchdog.h"
 #include "scope_state.h"
+#include "scope_cal.h"
 #include "input_handler.h"
 #include "theme.h"
 #include "math_channel.h"
@@ -40,10 +41,12 @@ extern void system_clock_config(void);
 #include "meter_voltage_wave.h"
 #include "flash_fs.h"
 #include "settings_store.h"
+#include "cal_backup.h"
 #include "usb_debug.h"
 #include "rtt.h"
 #include "fault.h"
 #include "redraw_gate.h"
+#include "scope_mask.h"
 
 /* ═══════════════════════════════════════════════════════════════════
  * Global State (extern'd via ui.h for UI modules)
@@ -72,9 +75,9 @@ volatile float         meter_hold_value = 0.0f;
 
 /* Fuse tester state */
 volatile uint8_t       fuse_type = 0;               /* FUSE_TYPE_ATO_ATC */
-volatile uint8_t       fuse_rating_idx = 4;          /* Default to 10A (index 4 in ATO table) */
+volatile uint8_t       fuse_rating_idx = 6;          /* 10 A (index 6 in the ATO table) */
 volatile uint8_t       fuse_view = 0;                /* FUSE_VIEW_DETAIL */
-volatile float         fuse_scan_threshold_mv = 0.5f; /* Pass/fail threshold */
+volatile float         fuse_scan_threshold_mv = 0.1f; /* Scan: DRAW at or above this drop */
 
 /* Modal overlay lock. While true, the display task suppresses ALL rendering
  * (queue commands are drained and dropped, periodic repaints skipped) so an
@@ -272,6 +275,42 @@ static redraw_gate_t siggen_gate = { 0, 0, 0, false, false };
  * hashed — that is what the new_data term is for — so this stays valid
  * as the FFT/waterfall/measurement-badge inputs get rewired to real
  * capture. */
+/* The bottom info bar is drawn on a full-screen redraw only (DCMD_REDRAW_ALL,
+ * which every button path sends). A state change from anywhere else -- the
+ * USB shell's `fpga scope trigmode`, `mode scope` -- left it stale: on
+ * 2026-09-30 it read "Normal" while the scope was in SINGLE. This hashes
+ * exactly what draw_info_bar() prints, and the display loop repaints the
+ * bar whenever it changes, whoever changed it. */
+static uint32_t g_info_bar_epoch;
+/* Set whenever this loop iteration repainted the current non-scope screen,
+ * so the out-of-scope popup is re-drawn on top of it (softkey UI P0). */
+static bool g_screen_painted;
+
+static uint32_t info_bar_epoch(void)
+{
+    uint32_t h = REDRAW_EPOCH_SEED;
+    h = redraw_epoch_mix(h, (uint32_t)current_mode | ((uint32_t)theme_get_id() << 8));
+    if (current_mode == MODE_OSCILLOSCOPE) {
+        const scope_state_t *s = scope_state_get();
+        h = redraw_epoch_mix(h, (uint32_t)scope_view);
+        h = redraw_epoch_mix(h, (uint32_t)s->trigger.mode | ((uint32_t)s->timebase_idx << 8));
+        h = redraw_epoch_mix(h, (uint32_t)s->ch1.enabled | ((uint32_t)s->ch1.vdiv_idx << 1)
+                                | ((uint32_t)s->ch1.coupling << 8));
+        h = redraw_epoch_mix(h, (uint32_t)s->ch2.enabled | ((uint32_t)s->ch2.vdiv_idx << 1)
+                                | ((uint32_t)s->ch2.coupling << 8));
+#ifdef FEATURE_FFT
+        const fft_config_t *cfg = fft_get_config();
+        if (cfg)
+            h = redraw_epoch_mix(h, (uint32_t)cfg->window | ((uint32_t)cfg->avg_count << 8)
+                                    | ((uint32_t)cfg->max_hold << 24));
+#endif
+    } else if (current_mode == MODE_MULTIMETER) {
+        h = redraw_epoch_mix(h, (uint32_t)meter_submode);
+        h = redraw_epoch_mix(h, meter_softkeys_epoch());
+    }
+    return h;
+}
+
 static uint32_t scope_ui_epoch(const scope_state_t *s)
 {
     uint32_t h = REDRAW_EPOCH_SEED;
@@ -381,6 +420,8 @@ static void scope_render(uint32_t frame, redraw_action_t action)
                                               draw_split_screen(frame); return; }
     if (scope_view == SCOPE_VIEW_WATERFALL) { ui_scope_full_draws++;
                                               draw_waterfall_screen();  return; }
+    if (scope_view == SCOPE_VIEW_XY)        { ui_scope_full_draws++;
+                                              draw_xy_screen();         return; }
 #endif
 #ifndef EMULATOR_BUILD
     if (action == REDRAW_INCREMENTAL) {
@@ -442,8 +483,10 @@ static void vDisplayTask(void *pvParameters)
              * measurement was taken with the far end switched off. Bench A/B/A
              * 2026-08-17: HIGH -> 276 bytes returned, LOW -> 0, HIGH -> 276. */
             fpga_set_meter_mux(current_mode == MODE_MULTIMETER);
-            if (current_mode == MODE_OSCILLOSCOPE)
+            if (current_mode == MODE_OSCILLOSCOPE) {
                 scope_entered_frame = frame;
+                ui_popup_overlay_cancel();    /* scope popups are the scope's own */
+            }
             redraw_gate_invalidate(&scope_gate);
             redraw_gate_invalidate(&siggen_gate);
             last_rendered_mode = current_mode;
@@ -476,6 +519,7 @@ static void vDisplayTask(void *pvParameters)
                 status_bar_invalidate();
                 draw_status_bar();
                 draw_info_bar();
+                g_info_bar_epoch = info_bar_epoch();
                 /* Draw current mode's screen */
                 if (current_mode == MODE_OSCILLOSCOPE) {
                     scope_render(frame, REDRAW_FULL);
@@ -493,6 +537,7 @@ static void vDisplayTask(void *pvParameters)
                 } else if (current_mode == MODE_SETTINGS) {
                     draw_settings_screen();
                 }
+                g_screen_painted = true;
                 break;
             case DCMD_DRAW_SCOPE:
                 /* Always honoured: the sender changed scope state or
@@ -506,7 +551,10 @@ static void vDisplayTask(void *pvParameters)
                 }
                 break;
             case DCMD_DRAW_METER:
-                if (current_mode == MODE_MULTIMETER) draw_meter_screen();
+                if (current_mode == MODE_MULTIMETER) {
+                    draw_meter_screen();
+                    g_screen_painted = true;
+                }
                 break;
             case DCMD_DRAW_SIGGEN:
                 if (current_mode == MODE_SIGNAL_GEN) {
@@ -519,10 +567,14 @@ static void vDisplayTask(void *pvParameters)
                     draw_siggen_screen(frame);
                     redraw_gate_mark(&siggen_gate, siggen_ui_epoch(),
                                      frame, REDRAW_FULL);
+                    g_screen_painted = true;
                 }
                 break;
             case DCMD_DRAW_SETTINGS:
-                if (current_mode == MODE_SETTINGS) draw_settings_screen();
+                if (current_mode == MODE_SETTINGS) {
+                    draw_settings_screen();
+                    g_screen_painted = true;
+                }
                 break;
             case DCMD_DRAW_STATUS_BAR:
                 draw_status_bar();
@@ -576,8 +628,32 @@ static void vDisplayTask(void *pvParameters)
             frame++;
             continue;
         }
+        {
+            uint32_t ib = info_bar_epoch();
+            if (ib != g_info_bar_epoch) {
+                draw_info_bar();
+                g_info_bar_epoch = ib;
+            }
+        }
         if (current_mode == MODE_OSCILLOSCOPE) {
             const scope_state_t *ss_anim = scope_state_get();
+            /* Mask pass/fail readout (badge row 2, below the live band): its
+             * own epoch, like the info bar, so a counter never sits stale
+             * waiting for a full repaint. Time view only -- the slot belongs
+             * to the time-view badge layout. */
+            {
+                static uint32_t g_mask_slot_epoch;
+                uint32_t me = scope_mask_epoch();
+#ifdef FEATURE_FFT
+                const bool time_view = (scope_view == SCOPE_VIEW_TIME);
+#else
+                const bool time_view = true;
+#endif
+                if (me != g_mask_slot_epoch && time_view) {
+                    scope_ui_mask_slot_refresh();
+                    g_mask_slot_epoch = me;
+                }
+            }
             if (ss_anim->running) {
                 /* ── Scope heartbeat / acquisition re-arm ───────────
                  * Keep the existing warmup and cadence for now, but use the
@@ -635,9 +711,15 @@ static void vDisplayTask(void *pvParameters)
                  * from `frame` alone: the synthetic demo waveform (only
                  * drawn before the first real sample) and the
                  * persistence overlay (which decays once per draw). */
-                q.animating        = !scope_acquisition_ready() || persist_enabled;
+                /* X-Y draws its own phosphor decay every frame, so it must
+                 * tick at the fast floor (200 ms) rather than the 1 s anim
+                 * cadence — otherwise the trail fades in visible 1 s steps. */
+                q.animating        = !scope_acquisition_ready() || persist_enabled
+                                     || scope_view == SCOPE_VIEW_XY;
                 q.full_min_frames  = SCOPE_FULL_MIN_FRAMES;
-                q.anim_tick_frames = SCOPE_ANIM_TICK_FRAMES;
+                q.anim_tick_frames = (scope_view == SCOPE_VIEW_XY)
+                                     ? SCOPE_FULL_MIN_FRAMES
+                                     : SCOPE_ANIM_TICK_FRAMES;
                 q.idle_tick_frames = q.incremental_ok ? SCOPE_IDLE_LIVE_FRAMES
                                                       : SCOPE_IDLE_FULL_FRAMES;
 
@@ -673,8 +755,30 @@ static void vDisplayTask(void *pvParameters)
                 last_meter_update = meter_screen_last_reading_display_update;
                 last_meter_frame  = frame;
                 last_meter_submode = meter_submode;
+                g_screen_painted = true;
             }
         }
+
+        /* Popups outside the scope (softkey UI P0, findings F15/F20): drawn
+         * over the screen, re-drawn after any repaint, and the screen
+         * repainted under them when they expire. */
+        if (current_mode != MODE_OSCILLOSCOPE) {
+            if (ui_popup_overlay_service(g_screen_painted) == 2) {
+                if (current_mode == MODE_MULTIMETER) {
+                    if (meter_layout != METER_LAYOUT_BIG &&
+                        meter_layout != METER_LAYOUT_LIMITS)
+                        meter_screen_invalidate();
+                    draw_meter_screen();
+                } else if (current_mode == MODE_SIGNAL_GEN) {
+                    draw_siggen_screen(frame);
+                    redraw_gate_mark(&siggen_gate, siggen_ui_epoch(),
+                                     frame, REDRAW_FULL);
+                } else if (current_mode == MODE_SETTINGS) {
+                    draw_settings_screen();
+                }
+            }
+        }
+        g_screen_painted = false;
 
         frame++;
     }
@@ -691,6 +795,13 @@ static void vDisplayTask(void *pvParameters)
  * the buttons use a bidirectional 4x3 matrix requiring active scanning.
  * See: reverse_engineering/analysis_v120/button_map_confirmed.md
  */
+#ifdef EMULATOR_BUILD
+/* Emulator key mailbox: Renode has no model of the 4x3 key matrix, so a host
+ * script writes a button id + 1 here (`sysbus WriteByte <&g_emu_key> n`) and
+ * the input task queues it like the `btn` shell command (input_inject_button). */
+volatile uint8_t g_emu_key __attribute__((used)) = 0;
+#endif
+
 static void vInputTask(void *pvParameters)
 {
     (void)pvParameters;
@@ -698,6 +809,13 @@ static void vInputTask(void *pvParameters)
 
     for (;;) {
         button_id_t pressed;
+#ifdef EMULATOR_BUILD
+        if (g_emu_key != 0u) {
+            const uint8_t k = (uint8_t)(g_emu_key - 1u);
+            g_emu_key = 0u;
+            (void)input_inject_button((button_id_t)k);
+        }
+#endif
 
         /* Block until TMR3 ISR confirms a debounced button press */
         if (xQueueReceive(xInputQueue, &pressed, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -707,6 +825,24 @@ static void vInputTask(void *pvParameters)
         /* Check in with health monitor */
         health_checkin(health_slot_input);
     }
+}
+
+/* Bench/test injection: post a press into the SAME queue the TMR3 key scan
+ * feeds, so everything downstream of the physical scan (the 15/15 matrix is
+ * hardware-confirmed) runs exactly as for a real press. Used by the shell's
+ * `btn` command; returns false if the queue is full or not yet created. */
+/* scope_cal's probe source: the channel's probe setting as a factor. */
+static float probe_factor_from_state(uint8_t ch)
+{
+    const scope_state_t *ss = scope_state_get();
+    const channel_state_t *c = (ch == 2u) ? &ss->ch2 : &ss->ch1;
+    return (c->probe == PROBE_10X) ? 10.0f : 1.0f;
+}
+
+bool input_inject_button(button_id_t b)
+{
+    if (xInputQueue == NULL) return false;
+    return xQueueSend(xInputQueue, &b, 0) == pdTRUE;
 }
 
 /*
@@ -838,6 +974,9 @@ int main(void)
 
     /* Initialize oscilloscope state */
     scope_state_init(scope_state_get());
+    /* Probe 1X/10X scales every volts readout through scope_cal (one
+     * application point); scope_state stays its one home. */
+    scope_cal_set_probe_source(probe_factor_from_state);
 
     /* Initialize LCD — using proven hwtest approach */
     {
@@ -988,6 +1127,15 @@ int main(void)
      * consumes the restored meter submode, and before the display task exists. */
     settings_store_init();
 
+#if defined(CAL_BACKUP_AUTO_RESTORE) && CAL_BACKUP_AUTO_RESTORE
+    /* OFF by default. Manual `cal restore` is the primary path. Even when built
+     * in, this only acts when the live MCU cal page reads blank/zeroed AND a
+     * valid W25Q backup exists — a programmed page is never overwritten
+     * automatically (cal_backup_should_auto_restore). Placed after
+     * settings_store_init() so the W25Q region layer is bound. */
+    (void)cal_backup_maybe_auto_restore();
+#endif
+
     /* settings_store_init() just restored scope_state.timebase_idx. Push it at
      * the FPGA so the axis label and the actual sample rate agree — without
      * this the restore silently undoes the reconcile inside fpga_init(), which
@@ -1001,6 +1149,9 @@ int main(void)
      * relays before the restore, so push the restored vdiv indices out too
      * (EXP-19, 2026-08-20). */
     fpga_reconcile_frontend_after_arm();
+    /* And the trigger level: the arm burst's 0xAD sits above any mid-scale
+     * signal, so PC0 never completes a capture (EXP-41, 2026-09-14). */
+    fpga_reconcile_trigger_after_arm();
 #endif
 
     /* Create queues */
@@ -1106,7 +1257,12 @@ unsigned int system_core_clock = 240000000;
 
 void SystemInit(void)
 {
-    /* Stub — do nothing in emulator mode. */
+    /* Stub for the emulator, except for the one thing every build needs: the
+     * FPU. The HAL's SystemInit grants CP10/CP11 full access (CPACR bits
+     * 20..23); without it the first VFP instruction takes a NOCP usage fault
+     * (CFSR 0x00080000), which is how Renode stopped right after the splash. */
+    *(volatile uint32_t *)0xE000ED88u |= (0xFu << 20);
+    __asm volatile ("dsb\n\tisb" ::: "memory");
 }
 
 void system_clock_config(void)

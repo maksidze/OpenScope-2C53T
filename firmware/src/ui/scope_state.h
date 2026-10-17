@@ -115,15 +115,20 @@ typedef struct {
     uint16_t h1_y;
     uint16_t h2_y;
 
-    /* Display scales for the cursor delta readout.
+    /*
+     * NO SCALE FIELDS HERE, DELIBERATELY (2026-09-12).
      *
-     * 0.0 means UNKNOWN — not "zero seconds per pixel". Both are 0 today
-     * (see scope_state_init) because seconds need a timebase and volts need
-     * per-range calibration, and this firmware has neither. Consumers MUST
-     * check for > 0 before using them; scope_ui.c falls back to samples and
-     * ADC counts, which are exact, when they are 0. */
-    float time_per_pixel;
-    float volts_per_pixel;
+     * This struct used to carry `time_per_pixel` and `volts_per_pixel`,
+     * seeded once with 10 ms across the screen and 8 V down it and updated by
+     * nothing — so every dt and dV the instrument printed was a function of
+     * the cursor positions alone. They were zeroed in August, which made the
+     * readout honest but left it disconnected from the measured tables.
+     *
+     * The readout now derives from scope_timebase.c (seconds per sample) and
+     * scope_cal.c (volts per ADC count) at draw time, via scope_cursor.c.
+     * Caching either here would be a second copy of a measured number, which
+     * is how the first one came to be wrong. Do not add them back.
+     */
 } cursor_state_t;
 
 /* Full oscilloscope state */
@@ -136,6 +141,34 @@ typedef struct {
                                      * scope_timebase.c. */
     bool            running;        /* Acquisition running/stopped */
     cursor_state_t  cursor;         /* Cursor measurement state */
+
+    /* Vertical graticule mode. false (default) = AUTOFIT: each channel's trace
+     * is scaled from its own min/max to fill the band, so the grid is a
+     * position reference, not a volts reference. true = TRUE SCALE: the trace
+     * is drawn at a FIXED SCOPE_CAL_COUNTS_PER_DIV counts per division, so one
+     * grid division means exactly the volts/div the status bar prints — but
+     * only on ranges scope_cal calls usable; a NONE range always autofits.
+     *
+     * Off by default because true scale needs the baseline centred (DAC1/PA4
+     * for CH1, TMR13/PA6 for CH2, via `fpga scope center`); uncentred, a
+     * DC-offset trace sits off-screen, which is honest but surprising. Toggle
+     * on the bench with `fpga scope graticule true`. */
+    bool            true_scale;
+
+    /* Software display trigger. true (default) = each frame's render window is
+     * shifted to start on the trigger source's level crossing (edge/level/source
+     * from `trigger`), so a periodic trace stands still instead of free-running.
+     * false = draw from sample 0 every frame (the old free-run "dancing"). When
+     * no crossing is found the render free-runs regardless, which is AUTO-mode
+     * behaviour. Toggle on the bench with `fpga scope softtrig`. */
+    bool            soft_trigger;
+
+    /* Horizontal position (2026-09-22): the screen column (0..319) where the
+     * trigger point is drawn. Default 160 = mid-screen, so half the window is
+     * pre-trigger. The record holds 512 samples each side of the hardware
+     * trigger once it is time-ordered (EXP-53, dev plan 2.3), so any column
+     * is reachable at 1 sample per pixel. Not persisted. */
+    int16_t         trig_x;
 } scope_state_t;
 
 /* ═══════════════════════════════════════════════════════════════════

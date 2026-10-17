@@ -17,6 +17,8 @@
 #include "cdc_desc.h"
 #include "dfu_boot.h"
 #include "flash_fs.h"
+#include "fw_loader.h"
+#include "cal_backup.h"
 #include "rtt.h"
 #include "continuity_buzzer.h"
 
@@ -48,6 +50,7 @@
 #include "../ui/scope_freq.h"
 #include "../ui/scope_measure.h"
 #include "../ui/scope_timebase.h"
+#include "../ui/scope_mask.h"
 #include "../ui/meter_voltage_wave.h"
 
 #include "fpga_cal_table.h"
@@ -548,9 +551,13 @@ static void fpga_stock_diag_print(void)
     usb_send_str("\r\n");
 }
 
+/* Shell replays of stock's scope word stream (`fpga scope entry/freq/trigger`).
+ * Unobeyed, like fpga.c's own scope sequences: these words have always gone
+ * out 00 00, and what the meter SoC does with an AA 55 frame whose high byte
+ * is a scope parameter has never been measured. */
 static bool fpga_send_cmd_timed(uint8_t cmd_hi, uint8_t cmd_lo, uint32_t delay_ms)
 {
-    BaseType_t ok = fpga_send_cmd(cmd_hi, cmd_lo);
+    BaseType_t ok = fpga_send_cmd_unobeyed(cmd_hi, cmd_lo);
     if (ok != pdTRUE) {
         usb_debug_printf("Queue full at %02X %02X\r\n", cmd_hi, cmd_lo);
         return false;
@@ -599,9 +606,12 @@ static uint16_t count_post_h2_non_ff_snapshot(
 
 static void cmd_version(void)
 {
+    /* The compiler rides on the Build line: whether the RAM installer called
+     * flash-resident memset (issue #42) depended on the toolchain, and every
+     * bench script already logs the line that starts with "Build:". */
     usb_debug_printf(
         "OpenScope 2C53T\r\n"
-        "Build: " __DATE__ " " __TIME__ "\r\n"
+        "Build: " __DATE__ " " __TIME__ ", gcc " __VERSION__ "\r\n"
 #ifdef FPGA_ALT_BITSTREAM
         "FPGA payload: " FPGA_BITSTREAM_NAME " (ALT — not the stock scope design)\r\n"
 #endif
@@ -668,8 +678,15 @@ static void cmd_status(void)
      * MISO bytes of the last 04/05 read — stock's CH1 b2==01 = buffer valid. */
     usb_debug_printf(
         "PC0 edges: %lu\r\n"
+        "acq latency: %lu ms (strobe -> commit, last cycle); poll reads before it: %lu (total %lu)\r\n"
+        "acq edge filter: %s  kept %lu  dropped %lu  unclassified %lu\r\n"
+        "acq rotation: %ld samples (seam of the last strobed record; -1 = none)\r\n"
         "acq hdr CH1: %02X %02X %02X  CH2: %02X %02X %02X\r\n",
         (unsigned long)fpga.pc0_edges,
+        (unsigned long)fpga.acq_last_latency_ms, (unsigned long)fpga.acq_polls_last, (unsigned long)fpga.acq_poll_reads,
+        fpga_acq_edge_filter_get() ? "ON" : "OFF", (unsigned long)fpga.acq_edge_kept,
+        (unsigned long)fpga.acq_edge_dropped, (unsigned long)fpga.acq_edge_unknown,
+        (long)fpga.acq_last_rot,
         fpga.acq_hdr_ch1[0], fpga.acq_hdr_ch1[1], fpga.acq_hdr_ch1[2],
         fpga.acq_hdr_ch2[0], fpga.acq_hdr_ch2[1], fpga.acq_hdr_ch2[2]
     );
@@ -924,6 +941,18 @@ static void cmd_usart_tx(const char *args)
                       "  e.g.: usart tx 00 09\r\n");
         return;
     }
+    /* Only bytes[0] and bytes[1] are ever transmitted. The loop above happily
+     * parsed up to eight, so `usart tx 00 09 AA BB CC` sent two bytes and
+     * reported "queued" with no hint that three were dropped — an operator
+     * building a frame here got a two-byte command and a plausible receipt.
+     * `fpga frame` is the command that takes a whole frame; say so instead of
+     * quietly truncating. */
+    while (*p == ' ') p++;
+    if (count > 2 || *p != '\0') {
+        usb_send_str("ERR: usart tx sends exactly two bytes (cmd_hi cmd_lo).\r\n"
+                     "     For a full 10-byte frame use: fpga frame <hi> <lo> [p1..p5 [ck]]\r\n");
+        return;
+    }
 
     /* Two ways this command used to lie, both of which have already voided a
      * bench experiment (exp(02), 2026-08-16 — recorded VOID, not negative):
@@ -1008,8 +1037,10 @@ static void cmd_fpga_frame(const char *args)
         if (!*p) break;
 
         uint32_t val;
-        if (parse_int(p, &val) != 0 || val > 0xFF) {
-            usb_debug_printf("ERR: bad byte at '%s'\r\n", p);
+        /* HEX — matches `usart raw` and the examples in this command's own
+         * help, which decimal parsing would have rejected (EXP-23). */
+        if (parse_hex32(p, &val) != 0 || val > 0xFF) {
+            usb_debug_printf("ERR: bad hex byte at '%s'\r\n", p);
             return;
         }
 
@@ -1500,7 +1531,14 @@ static void cmd_mem_read(const char *args)
     }
 
     uint32_t count = 1;
-    if (space) parse_int(space + 1, &count);
+    /* Checked, not discarded: parse_int() writes *out from strtoul() even when
+     * it fails, so `mem read 0x40021000 four` used to set count=0 and print
+     * absolutely nothing — indistinguishable from a region that reads back
+     * empty. */
+    if (space && parse_int(space + 1, &count) != 0) {
+        usb_send_str("Usage: mem read <hex_addr> [count]\r\n");
+        return;
+    }
     if (count > 64) count = 64;
 
     /* Align to 4 bytes */
@@ -1740,6 +1778,80 @@ restore:
             for (uint32_t i = 0; i < sizeof(b); i++) if (b[i] != 0xFF) { blank = false; break; }
         }
         usb_debug_printf("%s: sector restored to 0xFF\r\n", blank ? "PASS" : "FAIL");
+    }
+}
+
+/*
+ * Factory-cal self-protection (src/util/cal_backup.c).
+ *   cal status              report the MCU cal page and the W25Q backup
+ *   cal backup              copy the MCU cal page to the W25Q (safe: W25Q only)
+ *   cal restore [force] CONFIRM   write the W25Q backup back to MCU flash
+ * Restore refuses to overwrite a programmed (precious) page unless `force`.
+ */
+static void cmd_cal_status(void)
+{
+    cal_backup_report_t r;
+    if (cal_backup_status(&r) != CAL_BK_OK) {
+        usb_send_str("cal status: read failed\r\n");
+        return;
+    }
+    usb_debug_printf("live  @0x%08lX  %-14s crc=0x%08lX\r\n",
+                     (unsigned long)CAL_BACKUP_SRC_ADDR,
+                     cal_page_class_str(r.live_class),
+                     (unsigned long)r.live_crc);
+    if (!r.backup_present) {
+        usb_send_str("backup: region unreadable\r\n");
+    } else if (r.backup_status != CAL_REC_OK) {
+        usb_debug_printf("backup: %s (no valid record)\r\n",
+                         cal_rec_status_str(r.backup_status));
+    } else {
+        usb_debug_printf("backup: valid v%u  payload_crc=0x%08lX  src=0x%08lX\r\n",
+                         (unsigned)r.backup_version,
+                         (unsigned long)r.backup_payload_crc,
+                         (unsigned long)r.backup_src_addr);
+        usb_debug_printf("match : %s\r\n", r.match ? "yes (live == backup)"
+                                                   : "NO (live differs from backup)");
+    }
+}
+
+static void cmd_cal_backup(void)
+{
+    cal_bk_status_t st = cal_backup_store();
+    usb_debug_printf("cal backup: %s\r\n", cal_bk_status_str(st));
+    if (st == CAL_BK_ERR_LIVE_BLANK) {
+        usb_send_str("  (MCU page is blank/zeroed — nothing to preserve, existing backup kept)\r\n");
+    }
+}
+
+static void cmd_cal_restore(const char *args)
+{
+    char abuf[40];
+    char *saveptr = NULL;
+    bool force = false;
+    const char *confirm = NULL;
+
+    if (strlen(args) >= sizeof(abuf)) {
+        usb_send_str("Usage: cal restore [force] CONFIRM\r\n"); return;
+    }
+    strcpy(abuf, args);
+    char *t1 = strtok_r(abuf, " \t", &saveptr);
+    char *t2 = strtok_r(NULL, " \t", &saveptr);
+    if (t1 != NULL && strcmp(t1, "force") == 0) {
+        force = true;
+        confirm = t2;
+    } else {
+        confirm = t1;
+    }
+    if (confirm == NULL || strcmp(confirm, "CONFIRM") != 0) {
+        usb_send_str("Refused: append CONFIRM. This WRITES MCU flash 0x08006000.\r\n"
+                     "  cal restore CONFIRM        (refuses over a programmed page)\r\n"
+                     "  cal restore force CONFIRM  (overwrites a programmed page)\r\n");
+        return;
+    }
+    cal_bk_status_t st = cal_backup_restore(force);
+    usb_debug_printf("cal restore%s: %s\r\n", force ? " force" : "", cal_bk_status_str(st));
+    if (st == CAL_BK_ERR_LIVE_PRECIOUS) {
+        usb_send_str("  live page holds data — use 'cal restore force CONFIRM' only if you are sure\r\n");
     }
 }
 
@@ -2084,8 +2196,12 @@ static void cmd_fpga_cmd(const char *args)
         if (len >= (int)sizeof(cmd_str)) { usb_send_str("ERR\r\n"); return; }
         memcpy(cmd_str, args, len);
         cmd_str[len] = '\0';
-        if (parse_int(space + 1, &cmd_lo) != 0 || cmd_lo > 0xFF) {
-            usb_send_str("Usage: fpga cmd <hi> <lo>\r\n");
+        /* HEX, not parse_int(). FPGA command bytes are written in hex
+         * everywhere in this project; parsing them as decimal made
+         * `fpga cmd 05 14` transmit 0x050E and print a plausible
+         * confirmation of the wrong command (EXP-23). */
+        if (parse_hex32(space + 1, &cmd_lo) != 0 || cmd_lo > 0xFF) {
+            usb_send_str("Usage: fpga cmd <hi> <lo>   (HEX)\r\n");
             return;
         }
     } else {
@@ -2093,21 +2209,21 @@ static void cmd_fpga_cmd(const char *args)
         cmd_str[sizeof(cmd_str) - 1] = '\0';
     }
 
-    if (parse_int(cmd_str, &cmd_hi) != 0) {
-        usb_send_str("Usage: fpga cmd <hi> <lo>\r\n");
+    if (parse_hex32(cmd_str, &cmd_hi) != 0) {
+        usb_send_str("Usage: fpga cmd <hi> <lo>   (HEX)\r\n");
         return;
     }
 
     if (space == NULL) {
         /* Single combined value form: fpga cmd 0x0509 */
         if (cmd_hi > 0xFFFF) {
-            usb_send_str("Usage: fpga cmd <hi> <lo>\r\n");
+            usb_send_str("Usage: fpga cmd <hi> <lo>   (HEX)\r\n");
             return;
         }
         cmd_lo = cmd_hi & 0xFF;
         cmd_hi = (cmd_hi >> 8) & 0xFF;
     } else if (cmd_hi > 0xFF) {
-        usb_send_str("Usage: fpga cmd <hi> <lo>\r\n");
+        usb_send_str("Usage: fpga cmd <hi> <lo>   (HEX)\r\n");
         return;
     }
 
@@ -2125,7 +2241,15 @@ static void cmd_fpga_acq(const char *args)
 
     if (args && *args) {
         uint32_t mode = FPGA_ACQ_NORMAL + 1;  /* Explicit low-level trigger byte */
-        parse_int(args, &mode);
+        /* The return MUST be checked. parse_int() writes *out unconditionally,
+         * so a non-numeric argument did not fall back to the default above —
+         * it overwrote it with 0, fired a real acquisition on trigger byte 0
+         * and printed "mode 0: queued", which reads as a confirmation of
+         * something the operator never asked for. */
+        if (parse_int(args, &mode) != 0 || mode > 0xFF) {
+            usb_debug_printf("fpga acq: bad mode '%s'. Usage: fpga acq [0-255]\r\n", args);
+            return;
+        }
         ok = fpga_trigger_acquisition((uint8_t)mode);
         usb_debug_printf("Acquisition trigger mode %lu: %s\r\n",
                          mode, ok == pdTRUE ? "queued" : "FULL");
@@ -2175,6 +2299,52 @@ static void cmd_fpga_usart(const char *args)
     usb_send_str(buf);
 }
 
+/* `meter hdr [on|off]` — EXP-25 (issue #15). A/B the meter TX frame header
+ * between AA 55 (the default since the word table was corrected; what the
+ * meter SoC requires, measured on two units) and 00 00 (what this project sent
+ * before 2026-09-12, kept as the negative control: a transition under 00 00
+ * must produce zero echoes). Prints the echo ladder every time, so the A/B is
+ * one command and the numbers are on the same screen as the setting.
+ *
+ * Read the ladder from the bottom up when it stays at zero:
+ *   rx_bytes    moving => the RX ISR runs at all
+ *   data_frames moving => the frame sync + parser work (POSITIVE CONTROL:
+ *                         this is the 5A A5 branch, proven every session)
+ *   echo_start  moving => an 0xAA actually arrived and started a frame
+ *   echo_hdr    moving => the 0x55 second byte confirmed it
+ *   echo_valid  moving => byte[3] matched our cmd and byte[7] was 0xAA
+ *   echo_bad    moving => an echo arrived but failed that validation
+ * echo_start == 0 with data_frames climbing puts the fault on the WIRE, not
+ * in our parser. That distinction is the whole point of printing all six. */
+static void cmd_meter_hdr(const char *args)
+{
+    while (*args == ' ') args++;
+    if      (strncmp(args, "on",  2) == 0) fpga_meter_tx_header_set(true);
+    else if (strncmp(args, "off", 3) == 0) fpga_meter_tx_header_set(false);
+    else if (*args) { usb_send_str("usage: meter hdr [on|off]\r\n"); return; }
+
+    bool aa55 = fpga_meter_tx_header_get();
+    usb_debug_printf(
+        "meter TX header: %s  (frame[0]=%02X frame[1]=%02X)\r\n"
+        "  tx_count=%u rx_bytes=%u data_frames=%u\r\n"
+        "  echo_start=%u echo_hdr=%u echo_valid=%u echo_bad=%u echo_frames=%u\r\n"
+        "  transition: wake_ms=%u tries=%u ok=%u | unconfirmed=%u wake_timeouts=%u\r\n",
+        aa55 ? "AA 55 (default)" : "00 00 (legacy, negative control)",
+        aa55 ? 0xAA : 0x00, aa55 ? 0x55 : 0x00,
+        (unsigned)fpga.tx_count, (unsigned)fpga.rx_byte_count,
+        (unsigned)fpga.frame_count,
+        (unsigned)fpga.rx_sync_echo_start_count,
+        (unsigned)fpga.rx_sync_echo_header_count,
+        (unsigned)fpga.rx_echo_valid_count,
+        (unsigned)fpga.rx_echo_bad_count,
+        (unsigned)fpga.echo_count,
+        (unsigned)fpga.meter_soc_wake_ms,
+        (unsigned)fpga.meter_selector_attempts,
+        (unsigned)fpga.meter_selector_confirmed,
+        (unsigned)fpga.meter_selector_unconfirmed_total,
+        (unsigned)fpga.meter_soc_wake_timeouts);
+}
+
 /* `fpga rearm [on|off]` — stock's post-read re-arm write (reg 0x01 <- rate idx).
  * Runtime-toggleable so the comparison can be run A/B/A inside one boot: the
  * same probe, the same signal, the same FPGA configuration, one variable. */
@@ -2192,6 +2362,287 @@ static void cmd_fpga_rearm(const char *args)
     usb_send_str(buf);
 }
 
+/* `fpga rearmwait [ms]` — settle after the re-arm write before the next read
+ * (EXP-40). Stock's op-01 gate is a per-timebase TIME table, so the re-arm
+ * alone (EXP-29) read mid-capture at slow codes. Readback prints what is in
+ * force; the bench script derives ms from scope_timebase.c's rate table. */
+static void cmd_fpga_rearmwait(const char *args)
+{
+    char buf[112];
+    while (*args == ' ') args++;
+    if (*args) {
+        uint32_t ms = 0;
+        if (parse_int(args, &ms) != 0 || ms > 60000u) {
+            usb_send_str("usage: fpga rearmwait [ms 0..60000]\r\n"); return;
+        }
+        fpga_acq_rearm_wait_set((uint16_t)ms);
+    }
+    snprintf(buf, sizeof(buf), "acq re-arm wait %u ms after reg01 write (re-arm %s)\r\n",
+             (unsigned)fpga_acq_rearm_wait_get(), fpga_acq_rearm_get() ? "ON" : "OFF");
+    usb_send_str(buf);
+    if (fpga_acq_rearm_wait_get() && !fpga_acq_rearm_get())
+        usb_send_str("  NOTE: wait only applies with `fpga rearm on`.\r\n");
+}
+
+/* `fpga autowait [ms]` — AUTO-mode budget to wait for a PC0 edge before the
+ * free-run fallback read (EXP-42). A read starts a capture; completion pulses
+ * PC0; the compiled 25 ms is shorter than the capture at slow timebases. */
+static void cmd_fpga_autowait(const char *args)
+{
+    char buf[112];
+    while (*args == ' ') args++;
+    if (*args) {
+        uint32_t ms = 0;
+        if (parse_int(args, &ms) != 0 || ms > 60000u) {
+            usb_send_str("usage: fpga autowait [ms 0..60000, 0 = derive from timebase]\r\n"); return;
+        }
+        fpga_acq_auto_wait_set((uint16_t)ms);
+    }
+    snprintf(buf, sizeof(buf), "acq AUTO edge-wait %u ms before the free-run fallback read (%s, rate idx 0x%02X)\r\n",
+             (unsigned)fpga_acq_auto_wait_get(),
+             fpga_acq_auto_wait_is_override() ? "override" : "derived from timebase",
+             fpga_acq_rate_idx_get());
+    usb_send_str(buf);
+}
+
+/* `fpga pairgap [ms]` — delay between the 0x04 and 0x05 reads of a pair (EXP-45). */
+static void cmd_fpga_pairgap(const char *args)
+{
+    while (*args == ' ') args++;
+    if (*args) {
+        uint32_t ms = 0;
+        if (parse_int(args, &ms) != 0 || ms > 1000u) { usb_send_str("usage: fpga pairgap [ms 0..1000]\r\n"); return; }
+        fpga_acq_pair_gap_set((uint16_t)ms);
+    }
+    usb_debug_printf("acq pair gap %u ms between the 04 and 05 reads\r\n", (unsigned)fpga_acq_pair_gap_get());
+}
+
+/* `fpga postedge [ms]` — delay between a PC0 edge and the pair read (EXP-46). */
+static void cmd_fpga_postedge(const char *args)
+{
+    while (*args == ' ') args++;
+    if (*args) {
+        uint32_t ms = 0;
+        if (parse_int(args, &ms) != 0 || ms > 5000u) { usb_send_str("usage: fpga postedge [ms 0..5000, 0 = derive from timebase]\r\n"); return; }
+        fpga_acq_post_edge_set((uint16_t)ms);
+    }
+    usb_debug_printf("acq poll start %u ms after a handover (%s, rate idx 0x%02X)\r\n",
+                     (unsigned)fpga_acq_post_edge_get(),
+                     fpga_acq_post_edge_is_override() ? "override" : "derived: fill + 100 ms",
+                     fpga_acq_rate_idx_get());
+}
+
+/* `fpga pollgap [ms]` — poll cadence after the poll start (EXP-54). */
+static void cmd_fpga_pollgap(const char *args)
+{
+    while (*args == ' ') args++;
+    if (*args) {
+        uint32_t ms = 0;
+        if (parse_int(args, &ms) != 0 || ms < 1u || ms > 1000u) { usb_send_str("usage: fpga pollgap [ms 1..1000]\r\n"); return; }
+        fpga_acq_poll_gap_set((uint16_t)ms);
+    }
+    usb_debug_printf("acq poll gap %u ms; poll starts %u ms after a handover (%s); last handover after %lu poll reads, %lu total\r\n",
+                     (unsigned)fpga_acq_poll_gap_get(), (unsigned)fpga_acq_post_edge_get(),
+                     fpga_acq_post_edge_is_override() ? "override" : "derived: fill + 100 ms",
+                     (unsigned long)fpga.acq_polls_last, (unsigned long)fpga.acq_poll_reads);
+}
+
+/* `fpga autolive [on|off]` -- EXP-72: AUTO shows every roll read once no
+ * handover has come for a whole budget (default on; off = v0.4.1's one per
+ * budget). */
+static void cmd_fpga_autolive(const char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "on", 2) == 0) fpga_acq_auto_live_set(true);
+    else if (strncmp(args, "off", 3) == 0) fpga_acq_auto_live_set(false);
+    usb_debug_printf("acq AUTO live %s\r\n", fpga_acq_auto_live_get() ? "ON (every roll read once untriggered)" : "OFF (one roll read per budget)");
+}
+
+/* `fpga holdlog [on|off]` -- EXP-72: per-handover interval log, recorded by
+ * the acq task (no shell traffic in the window). No argument dumps it. */
+static void cmd_fpga_holdlog(const char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "on", 2) == 0) {
+        usb_send_str(fpga_holdlog_start() ? "holdlog on (cleared)\r\n" : "holdlog: no heap\r\n");
+        return;
+    }
+    if (strncmp(args, "off", 3) == 0) fpga_holdlog_stop();
+    uint16_t n = fpga_holdlog_count();
+    usb_debug_printf("holdlog %s n=%u (dt_ms polls edges)\r\n", fpga_holdlog_active() ? "on" : "off", (unsigned)n);
+    fpga_holdlog_ent_t e;
+    for (uint16_t k = 0; k < n && fpga_holdlog_get(k, &e); k++)
+        usb_debug_printf("hl %u %u %u\r\n", (unsigned)e.dt_ms, (unsigned)e.polls, (unsigned)e.edges);
+}
+
+/* `fpga scope hpos [8..312]` — the screen column for the trigger point (the
+ * same field MOVE -> Position -> LEFT/RIGHT sets). */
+static void cmd_fpga_scope_hpos(const char *args)
+{
+    while (*args == ' ') args++;
+    scope_state_t *ss = scope_state_get();
+    if (*args) {
+        uint32_t v = 0;
+        if (parse_int(args, &v) != 0 || v < 8u || v > 312u) { usb_send_str("usage: fpga scope hpos [8..312]\r\n"); return; }
+        ss->trig_x = (int16_t)v;
+    }
+    usb_debug_printf("trigger position: asked column %d; last window landed at %d (anchor %s)\r\n",
+                     (int)ss->trig_x, (int)scope_ui_trig_x_actual(),
+                     scope_ui_trig_anchor() == 2 ? "hardware" : scope_ui_trig_anchor() == 1 ? "soft" : "none");
+}
+
+/* `fpga scope edge [rising|falling]` — the same field Settings -> Trigger Edge
+ * sets; it steers the display's soft trigger and the MCU edge filter. */
+static void cmd_fpga_scope_edge(const char *args)
+{
+    while (*args == ' ') args++;
+    scope_state_t *ss = scope_state_get();
+    if (*args) {
+        if      (strncmp(args, "rising",  6) == 0) ss->trigger.edge = TRIG_RISING;
+        else if (strncmp(args, "falling", 7) == 0) ss->trigger.edge = TRIG_FALLING;
+        else { usb_send_str("usage: fpga scope edge [rising|falling]\r\n"); return; }
+    }
+    usb_debug_printf("trigger edge %s (edge filter %s)\r\n", trigger_edge_labels[ss->trigger.edge],
+                     fpga_acq_edge_filter_get() ? "ON" : "OFF");
+}
+
+/* `fpga scope coupling` — READ-ONLY: each channel's coupling label beside the
+ * relay pin it is supposed to describe (PD12 CH1 / PD13 CH2, HIGH = DC) and
+ * the pin's GPIO mode. Change it with the buttons (`btn ch1` / `btn ch2`):
+ * that is the path under test, and a second writer here would be a second
+ * place for the label and the relay to disagree. */
+static void cmd_fpga_scope_coupling(const char *args)
+{
+    (void)args;
+    const scope_state_t *ss = scope_state_get();
+    for (int ch = 0; ch < 2; ch++) {
+        const channel_state_t *c = ch ? &ss->ch2 : &ss->ch1;
+        unsigned pin = ch ? 13u : 12u;
+        unsigned mode = (unsigned)((GPIOD->cfghr >> ((pin - 8u) * 4u)) & 0xFu);
+        unsigned odt = (unsigned)((GPIOD->odt >> pin) & 1u);
+        bool gpio_out = (mode >= 1u && mode <= 3u);
+        const char *relay = !gpio_out ? "not-gpio" : odt ? "DC" : "AC";
+        bool agree = gpio_out && ((c->coupling == COUPLING_DC) == (odt != 0u));
+        usb_debug_printf("CH%d label %s  PD%u mode 0x%X odt %u -> relay %s  %s\r\n",
+                         ch + 1, coupling_labels[c->coupling], pin, mode, odt, relay,
+                         agree ? "AGREE" : "DISAGREE");
+    }
+}
+
+/* `fpga edgefilter [on|off]` — the MCU-side trigger edge filter. */
+static void cmd_fpga_edgefilter(const char *args)
+{
+    while (*args == ' ') args++;
+    if (*args) {
+        if      (strncmp(args, "on",  2) == 0) fpga_acq_edge_filter_set(true);
+        else if (strncmp(args, "off", 3) == 0) fpga_acq_edge_filter_set(false);
+        else { usb_send_str("usage: fpga edgefilter [on|off]\r\n"); return; }
+    }
+    const scope_state_t *ss = scope_state_get();
+    usb_debug_printf("edge filter %s, edge %s: kept %lu dropped %lu unclassified %lu\r\n",
+                     fpga_acq_edge_filter_get() ? "ON" : "OFF",
+                     trigger_edge_labels[ss->trigger.edge],
+                     (unsigned long)fpga.acq_edge_kept, (unsigned long)fpga.acq_edge_dropped,
+                     (unsigned long)fpga.acq_edge_unknown);
+}
+
+/* `fpga holdread` — retired by EXP-54: the read that strobes PC0 is the record. */
+static void cmd_fpga_holdread(const char *args)
+{
+    (void)args;
+    usb_send_str("retired (EXP-54): PC0 strobes the read that hands over the record, so that read is committed; use fpga pollgap / fpga postedge\r\n");
+}
+
+/* `fpga unrotate [on|off]` — time-order strobed records at their seam (dev plan 2.3). */
+static void cmd_fpga_unrotate(const char *args)
+{
+    /* Seam-based since 2026-09-22 (dev plan 2.3); the EXP-52 offset argument
+     * belonged to the retired latency model and is no longer accepted. */
+    while (*args == ' ') args++;
+    if (*args) {
+        if      (strncmp(args, "on",  2) == 0) fpga_acq_unrotate_set(true);
+        else if (strncmp(args, "off", 3) == 0) fpga_acq_unrotate_set(false);
+        else { usb_send_str("usage: fpga unrotate [on|off]\r\n"); return; }
+    }
+    usb_debug_printf("acq unrotate %s (seam-based); last strobed record's seam at %ld (-1 = none found)\r\n",
+                     fpga_acq_unrotate_get() ? "ON" : "OFF", (long)fpga.acq_last_rot);
+}
+
+/* `fpga acqbr [0-7|off]` — SPI3 clock divider the acq task sets before each pair (EXP-46). */
+static void cmd_fpga_acqbr(const char *args)
+{
+    while (*args == ' ') args++;
+    if (*args) {
+        if (strncmp(args, "off", 3) == 0) fpga_acq_read_br_set(0xFF);
+        else {
+            uint32_t br = 0;
+            if (parse_int(args, &br) != 0 || br > 7u) { usb_send_str("usage: fpga acqbr [0-7|off]\r\n"); return; }
+            fpga_acq_read_br_set((uint8_t)br);
+        }
+    }
+    if (fpga_acq_read_br_get() == 0xFF) usb_send_str("acq read clock: not set by the task (whatever is in force)\r\n");
+    else usb_debug_printf("acq read clock: br=%u (/%u) set before each pair\r\n", fpga_acq_read_br_get(), 2u << fpga_acq_read_br_get());
+}
+
+/* `fpga scope trigmode [auto|normal|single]` — set/read the acq wait policy
+ * (EXP-30 noted nothing in the shell could set it; the time-view button
+ * cycles cursors). Pure state; the acq task reads it each cycle. */
+static void cmd_fpga_scope_trigmode(const char *args)
+{
+    while (*args == ' ') args++;
+    scope_state_t *ss = scope_state_get();
+    if (*args) {
+        if      (strncmp(args, "auto",   4) == 0) ss->trigger.mode = TRIG_AUTO;
+        else if (strncmp(args, "normal", 6) == 0) ss->trigger.mode = TRIG_NORMAL;
+        else if (strncmp(args, "single", 6) == 0) ss->trigger.mode = TRIG_SINGLE;
+        else { usb_send_str("usage: fpga scope trigmode [auto|normal|single]\r\n"); return; }
+    }
+    usb_debug_printf("trigger mode %s (acq wait policy: AUTO falls back after the edge-wait; NORMAL/SINGLE hold)\r\n",
+                     trigger_mode_labels[ss->trigger.mode]);
+}
+
+/* `fpga scope level [level]` — the digital trigger level (reg 0x08) from the
+ * UI's -100..100, through the one entry point; prints the code in force. */
+static void cmd_fpga_scope_level(const char *args)
+{
+    while (*args == ' ') args++;
+    scope_state_t *ss = scope_state_get();
+    if (*args) {
+        int neg = 0; uint32_t lv = 0; const char *p = args;
+        if (*p == '-') { neg = 1; p++; }
+        if (parse_int(p, &lv) != 0 || lv > 100u) {
+            usb_send_str("usage: fpga scope level [-100..100]\r\n"); return;
+        }
+        ss->trigger.level = neg ? -(int)lv : (int)lv;
+        if (!fpga_apply_trigger_level(ss->trigger.level)) {
+            usb_send_str("acq task would not park — reg 0x08 NOT written\r\n"); return;
+        }
+    }
+    usb_debug_printf("trigger level %d -> reg 0x08 code 0x%02X in force (boot reconcile wrote 0x%02X)\r\n",
+                     ss->trigger.level, fpga_acq_trig_code_get(), fpga_trigger_reconcile_code());
+}
+
+/* `fpga acqgate [on|off]` — stock's PRE-read gate (EXP-29/30). Pairs with
+ * `fpga rearm`; the two are load-bearing for each other. */
+static void cmd_fpga_acqgate(const char *args)
+{
+    char buf[160];
+    while (*args == ' ') args++;
+    if (*args) {
+        if      (strncmp(args, "on",  2) == 0) fpga_acq_gate_set(true);
+        else if (strncmp(args, "off", 3) == 0) fpga_acq_gate_set(false);
+        else { usb_send_str("usage: fpga acqgate [on|off]\r\n"); return; }
+    }
+    snprintf(buf, sizeof(buf),
+             "acq gate %s (AUTO reads only on a data-ready edge)  skips=%lu\r\n",
+             fpga_acq_gate_get() ? "ON" : "OFF",
+             (unsigned long)fpga_acq_gate_skips());
+    usb_send_str(buf);
+    if (fpga_acq_gate_get() && !fpga_acq_rearm_get())
+        usb_send_str("  WARN: gate ON with re-arm OFF — PC0 may never arrive "
+                     "and the trace will freeze. `fpga rearm on`.\r\n");
+}
+
 /* `fpga rate [idx]` — the reg-0x01 value the re-arm rewrites. Setting it here
  * keeps the re-arm from silently reverting a timebase chosen elsewhere. */
 static void cmd_fpga_rate(const char *args)
@@ -2199,8 +2650,14 @@ static void cmd_fpga_rate(const char *args)
     char buf[80];
     while (*args == ' ') args++;
     if (*args) {
-        unsigned v = (unsigned)strtoul(args, NULL, 16);
-        if (v > 0xFF) { usb_send_str("usage: fpga rate <hex idx>\r\n"); return; }
+        /* parse_hex32(), not a bare strtoul(): `fpga rate scope` used to
+         * silently become 0x00 and be echoed back as a successful setting,
+         * changing what the re-arm writes into FPGA reg 0x01. */
+        uint32_t v;
+        if (parse_hex32(args, &v) != 0 || v > 0xFF) {
+            usb_send_str("usage: fpga rate <hex idx>\r\n");
+            return;
+        }
         fpga_acq_rate_idx_set((uint8_t)v);
     }
     snprintf(buf, sizeof(buf), "acq rate idx = 0x%02X\r\n", fpga_acq_rate_idx_get());
@@ -2319,44 +2776,60 @@ static uint8_t spi3_raw_xfer(uint8_t tx);
  * above. The operator must keep the input quiet/DC while this runs (no AC
  * signal) — it averages a static level.
  *
- * Diagnostic / bench only — it does NOT touch the normal acquisition path.
- * The continuous acquisition task is parked with fpga_acq_pause() for the
- * whole command so our CS-framed reads never interleave with its capture
- * frames (same hazard class as `spi3 opread` / `spi3 opsweep`).
+ * Diagnostic / bench only. It runs with the acq task LIVE (it reads the acq
+ * task's RAM buffer, not SPI3, so there is no bus contention) — the task must
+ * keep running to refresh that buffer at each new DC operating point.
  */
 #define SCOPE_CENTER_TARGET   128u   /* ADC mid-scale code we center on    */
-#define SCOPE_CENTER_NBYTES   256u   /* payload bytes averaged per read     */
-#define SCOPE_CENTER_AVG      2u     /* reads averaged to knock down noise  */
+#define SCOPE_CENTER_AVG      2u     /* buffer medians averaged per step    */
 #define SCOPE_CENTER_ITERS    11u    /* binary-search steps over 0..4095    */
 #define SCOPE_CENTER_SETTLE_MS 480u  /* >= one ~430ms buffer fill after a DAC
                                         move, so the read is not stale         */
+#define SCOPE_CENTER_COMMIT_TIMEOUT_MS 4000u /* bound on waiting for fresh
+                                        commits; 0x12 AUTO fallback ~1.5 s   */
+static uint32_t scope_center_stale_steps;  /* steps that timed out waiting */
 
 /* One capture read window (opcode 0x04 = CH1 buffer, 0x05 = CH2); returns the
  * mean of the first `nbytes` payload bytes. Same framing as spi3_opread_window
  * (one CS-LOW window, opcode + 2 filler bytes, then payload). The two filler
  * bytes are the header stock discards. Caller must already hold the acq pause. */
-static uint32_t scope_center_read_mean(uint8_t opcode, uint32_t nbytes)
+/*
+ * Median of the acq task's LIVE RAM buffer via an 8-bit histogram.
+ *
+ * Two design choices, both learned on the bench (2026-08-28/29):
+ *
+ * 1. MEDIAN, not mean. The old servo optimised the arithmetic mean, which a
+ *    clipped AC signal biases toward the OPEN rail: at large amplitude the sine
+ *    clips the top, the mean reads < 128, the search raises DAC1, that clips
+ *    MORE, and it runs away to a rail (0.5 Vpp centred perfectly at 2415/128,
+ *    but 4 Vpp diverged to 3071). The median equals the DC baseline regardless
+ *    of one-rail clipping until more than half the samples clip, and stays
+ *    monotonic in DAC1, so the binary search converges at any amplitude.
+ *
+ * 2. Read the RAM buffer the RUNNING acq task keeps fresh, NOT a direct SPI3
+ *    opread with the acq task paused. The capture buffer is a rolling window;
+ *    with acq paused nothing re-arms it, so after a DAC step it FREEZES holding
+ *    a bimodal old+new mix and no statistic recovers the new operating point
+ *    (bench: dac=3071 read 120, frozen, while its true settled level is 207).
+ *    The acq task re-arms and commits continuously, so its buffer tracks the
+ *    DAC — that is exactly the path `spi3 acqread` reads, which settles in
+ *    ~350 ms. Centering therefore runs with acq LIVE and reads RAM (no SPI3
+ *    from this side, so no bus contention).
+ */
+static uint32_t scope_center_buf_median(uint8_t ch)
 {
-    uint32_t ssum = 0;
-    GPIOB->clr = (1 << 6);                 /* CS assert (PB6 LOW)    */
-    (void)spi3_raw_xfer(opcode);
-    (void)spi3_raw_xfer(0xFF);
-    (void)spi3_raw_xfer(0xFF);
-    for (uint32_t i = 0; i < nbytes; i++)
-        ssum += spi3_raw_xfer(0xFF);
-    GPIOB->scr = (1 << 6);                 /* CS deassert (PB6 HIGH) */
-    return nbytes ? ssum / nbytes : 0;
-}
-
-/* Average SCOPE_CENTER_AVG windows for a noise-robust mean. */
-static uint32_t scope_center_robust_mean(uint8_t opcode)
-{
-    uint32_t acc = 0;
-    for (uint32_t k = 0; k < SCOPE_CENTER_AVG; k++) {
-        acc += scope_center_read_mean(opcode, SCOPE_CENTER_NBYTES);
-        vTaskDelay(pdMS_TO_TICKS(5));
+    const volatile uint8_t *b = (ch == 2) ? fpga_get_ch2_buf()
+                                          : fpga_get_ch1_buf();
+    if (b == NULL) return 128;
+    uint16_t hist[256] = {0};
+    for (uint32_t i = 0; i < FPGA_ADC_BUF_SIZE; i++)
+        hist[b[i]]++;
+    uint32_t half = FPGA_ADC_BUF_SIZE / 2u, cum = 0;
+    for (uint32_t v = 0; v < 256; v++) {
+        cum += hist[v];
+        if (cum >= half) return v;
     }
-    return acc / SCOPE_CENTER_AVG;
+    return 128;
 }
 
 /* Binary-search the channel's offset reference for a mean of ~128. Assumes the
@@ -2369,10 +2842,56 @@ static uint32_t scope_center_robust_mean(uint8_t opcode)
  * CCTRL C1P), so the duty->voltage sense could invert. If a CH2 search
  * converges on a rail, suspect the direction before suspecting the pin: sweep
  * `trig2 raw` by hand and watch which way the mean moves. */
+/*
+ * Settle the acq buffer after a DAC step: the running acq task re-commits its
+ * RAM buffer every ~33 ms poll, and the operating point settles in ~350 ms
+ * (bench), so wait a generous fixed budget then average a couple of RAM-buffer
+ * medians to knock down per-frame noise.
+ */
+/* Wait until the acq task has committed `n` records whose reads began after
+ * this call. The frame generation is a seqlock: +2 per commit, odd while a
+ * commit is in progress. Returns false on timeout.
+ *
+ * Why not a fixed delay (the pre-2026-09-22 version slept 480 ms): under the
+ * poll loop (EXP-54) the RAM buffer changes only on a commit, and with no
+ * trigger crossing AUTO commits one free-run record per fallback budget,
+ * 3 x fill + 230 ms = 475 ms at 0x10 and ~1.46 s at 0x12. A fixed 480 ms
+ * therefore read the buffer from BEFORE the DAC step at slow codes and
+ * sometimes at 0x10; the binary search steered on stale medians and the
+ * servo reported "DAC1=2047 (median=101)" while the record then read 185. The
+ * first commit after the write may have been read before the DAC settled, so
+ * the caller asks for two. */
+static bool scope_center_wait_commits(uint32_t n)
+{
+    uint32_t g = fpga_acq_frame_generation() & ~1u;
+    uint32_t target = g + 2u * n;
+    TickType_t t0 = xTaskGetTickCount();
+    while ((int32_t)((fpga_acq_frame_generation() & ~1u) - target) < 0) {
+        if ((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(SCOPE_CENTER_COMMIT_TIMEOUT_MS))
+            return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return true;
+}
+
+static uint32_t scope_center_settle_level(uint8_t ch)
+{
+    /* Keep the historical floor for the analog settle (~350 ms bench), then
+     * require fresh commits so the median is of a record read after the DAC
+     * moved. On timeout the median is still taken but the search is steering
+     * blind; the caller reports the count. */
+    vTaskDelay(pdMS_TO_TICKS(SCOPE_CENTER_SETTLE_MS));
+    if (!scope_center_wait_commits(2u)) scope_center_stale_steps++;
+    uint32_t acc = 0;
+    for (uint32_t k = 0; k < SCOPE_CENTER_AVG; k++) {
+        if (k > 0 && !scope_center_wait_commits(1u)) scope_center_stale_steps++;
+        acc += scope_center_buf_median(ch);
+    }
+    return acc / SCOPE_CENTER_AVG;
+}
+
 static void scope_center_one(uint8_t ch, uint16_t *out_dac, uint32_t *out_mean)
 {
-    const uint8_t opcode = (ch == 2) ? 0x05u : 0x04u;
-
     uint16_t lo = 0, hi = 4095;
     uint16_t best_dac = 2048;
     uint32_t best_mean = 0;
@@ -2382,26 +2901,28 @@ static void scope_center_one(uint8_t ch, uint16_t *out_dac, uint32_t *out_mean)
         uint16_t mid = (uint16_t)((lo + hi) / 2);
         if (ch == 2) scope_trigger_ch2_raw(mid);
         else         scope_trigger_dac_raw(mid);
-        /* BUGFIX 2026-08-14 (round 2): the DAC moves fine, but the capture
-         * buffer FREE-RUNS and takes ~430 ms to refill (1024 samples at
-         * ~2.4 kS/s). A 10 ms settle read the STALE buffer (old, roughly-
-         * centered DC ~130) every iteration, so the search never converged —
-         * the first "DAC init" fix was aimed at the wrong cause. Wait a full
-         * buffer fill so the read reflects the NEW DC operating point. */
-        vTaskDelay(pdMS_TO_TICKS(SCOPE_CENTER_SETTLE_MS));
-        uint32_t mean = scope_center_robust_mean(opcode);
-        uint32_t err = (mean > SCOPE_CENTER_TARGET)
-                       ? mean - SCOPE_CENTER_TARGET
-                       : SCOPE_CENTER_TARGET - mean;
+        /* Wait for the running acq task to re-commit its RAM buffer at the new
+         * DC operating point, then read the settled median from that buffer.
+         * (The old paused-SPI path froze the rolling buffer mid-transition —
+         * see scope_center_buf_median.) */
+        uint32_t level = scope_center_settle_level(ch);
+        uint32_t err = (level > SCOPE_CENTER_TARGET)
+                       ? level - SCOPE_CENTER_TARGET
+                       : SCOPE_CENTER_TARGET - level;
         if (err < best_err) {
             best_err = err;
             best_dac = mid;
-            best_mean = mean;
+            best_mean = level;
         }
-        if (mean < SCOPE_CENTER_TARGET) lo = mid;   /* need higher DAC1 */
-        else                            hi = mid;   /* need lower  DAC1 */
+        if (level < SCOPE_CENTER_TARGET) lo = mid;   /* need higher DAC1 */
+        else                             hi = mid;   /* need lower  DAC1 */
         if (hi - lo <= 1) break;
     }
+    /* Leave the reference at the value we REPORT. Until 2026-09-22 the DAC
+     * stayed at the last probe (`mid`), not at best_dac, so the printed
+     * "center DAC1=..." could differ from what the hardware held. */
+    if (ch == 2) scope_trigger_ch2_raw(best_dac);
+    else         scope_trigger_dac_raw(best_dac);
     *out_dac = best_dac;
     *out_mean = best_mean;
 }
@@ -2482,7 +3003,17 @@ static void cmd_fpga_scope_timebase(const char *args)
     scope_state_t *ss = scope_state_get();
 
     if (*args) {
-        unsigned v = (unsigned)strtoul(args, NULL, 16);
+        /* parse_hex32(), not a bare strtoul(). `fpga scope timebase fast`
+         * used to parse as 0, pass the range check below, write BOTH the
+         * display state and reg 0x01, and then print the full success block —
+         * which is the exact display-vs-hardware divergence this command was
+         * added (EXP-17) to prevent. */
+        uint32_t v;
+        if (parse_hex32(args, &v) != 0) {
+            usb_debug_printf("usage: fpga scope timebase <hex code 00-%02X>\r\n",
+                             SCOPE_TIMEBASE_CODE_COUNT - 1);
+            return;
+        }
         if (v >= SCOPE_TIMEBASE_CODE_COUNT) {
             usb_debug_printf("usage: fpga scope timebase <hex code 00-%02X>\r\n",
                              SCOPE_TIMEBASE_CODE_COUNT - 1);
@@ -2512,10 +3043,79 @@ static void cmd_fpga_scope_timebase(const char *args)
                      lbl);
 }
 
+/* `fpga scope graticule [auto|true|toggle]` — the M3 seam. Choose whether the
+ * live trace is drawn at TRUE volts/div (one grid division == the volts/div the
+ * status bar prints, on calibrated ranges) or AUTOFIT (scaled to fill the band,
+ * so the grid is a position reference only). Autofit at boot; this flips it on
+ * the bench without a rebuild. True scale needs a centred baseline, so it also
+ * prints which ranges will honour it and the reminder to center first. */
+static void cmd_fpga_scope_graticule(const char *args)
+{
+    while (*args == ' ') args++;
+    scope_state_t *ss = scope_state_get();
+
+    if (strncmp(args, "true", 4) == 0)        ss->true_scale = true;
+    else if (strncmp(args, "auto", 4) == 0)   ss->true_scale = false;
+    else if (strncmp(args, "toggle", 6) == 0) ss->true_scale = !ss->true_scale;
+    else if (*args) {
+        usb_send_str("usage: fpga scope graticule [auto|true|toggle]\r\n");
+        return;
+    }
+
+    usb_debug_printf("graticule: %s\r\n",
+                     ss->true_scale ? "TRUE SCALE (grid == volts/div)"
+                                    : "autofit (grid == position only)");
+    if (ss->true_scale) {
+        char l1[12], l2[12];
+        scope_cal_range_label(1u, ss->ch1.vdiv_idx, l1, sizeof(l1));
+        scope_cal_range_label(2u, ss->ch2.vdiv_idx, l2, sizeof(l2));
+        usb_debug_printf("  CH1 rng %u -> %s/div %s\r\n",
+                         (unsigned)ss->ch1.vdiv_idx, l1,
+                         scope_cal_true_scale_ok(1u, ss->ch1.vdiv_idx)
+                             ? "" : "(no cal -> autofit)");
+        usb_debug_printf("  CH2 rng %u -> %s/div %s\r\n",
+                         (unsigned)ss->ch2.vdiv_idx, l2,
+                         scope_cal_true_scale_ok(2u, ss->ch2.vdiv_idx)
+                             ? "" : "(no cal -> autofit)");
+        usb_send_str("  center the baseline first: `fpga scope center`\r\n");
+    }
+}
+
+/* `fpga scope softtrig [on|off|toggle]` — the software display trigger. When on
+ * (default), each frame's render window starts on the trigger source's level
+ * crossing so a periodic trace stands still; off free-runs from sample 0 (the
+ * old "dancing"). Handy for A/B on the bench: off = dances, on = locked. */
+static void cmd_fpga_scope_softtrig(const char *args)
+{
+    while (*args == ' ') args++;
+    scope_state_t *ss = scope_state_get();
+
+    if (strncmp(args, "on", 2) == 0)          ss->soft_trigger = true;
+    else if (strncmp(args, "off", 3) == 0)    ss->soft_trigger = false;
+    else if (strncmp(args, "toggle", 6) == 0) ss->soft_trigger = !ss->soft_trigger;
+    else if (*args) {
+        usb_send_str("usage: fpga scope softtrig [on|off|toggle]\r\n");
+        return;
+    }
+
+    usb_debug_printf("softtrig: %s   (level=%d px, %s, src=CH%d)\r\n",
+                     ss->soft_trigger ? "ON (trace locked to trigger)"
+                                      : "off (free-run / dancing)",
+                     (int)ss->trigger.level,
+                     ss->trigger.edge == TRIG_RISING ? "rising" : "falling",
+                     ss->trigger.source == TRIG_SRC_CH2 ? 2 : 1);
+}
+
 static void cmd_fpga_scope_freq(const char *args)
 {
     uint32_t reps = 10;
-    if (args && *args) parse_int(args, &reps);
+    /* Checked: a failed parse_int() still writes 0 into reps, so a bad
+     * argument silently ran ONE rep and reported `answered 1/1` as though a
+     * single rep had been requested. */
+    if (args && *args && parse_int(args, &reps) != 0) {
+        usb_send_str("Usage: fpga scope freq [reps 1-100]\r\n");
+        return;
+    }
     if (reps == 0u) reps = 1u;
     if (reps > 100u) reps = 100u;
 
@@ -2585,7 +3185,12 @@ static void cmd_fpga_scope_freq(const char *args)
 static void cmd_fpga_scope_measure(const char *args)
 {
     uint32_t reps = 5;
-    if (args && *args) parse_int(args, &reps);
+    /* Checked — see cmd_fpga_scope_freq: an unparseable argument used to
+     * degrade this to a single record without saying so. */
+    if (args && *args && parse_int(args, &reps) != 0) {
+        usb_send_str("Usage: fpga scope measure [reps 1-50]\r\n");
+        return;
+    }
     if (reps == 0u) reps = 1u;
     if (reps > 50u) reps = 50u;
 
@@ -2596,14 +3201,19 @@ static void cmd_fpga_scope_measure(const char *args)
     const float k1 = scope_cal_volts_per_count(1u, ss->ch1.vdiv_idx);
     const float k2 = scope_cal_volts_per_count(2u, ss->ch2.vdiv_idx);
 
+    /* k1/k2 are probe-TIP volts per count (scope_cal applies the probe
+     * factor); probeN says which factor, so a bench script can tell a 10x
+     * setting from a calibration change. Appended, so parsers keep working. */
     usb_debug_printf("badge sources: rng1=%u k1_uV=%lu  rng2=%u k2_uV=%lu  "
-                     "tb=0x%02X inforce=0x%02X fs=%lu\r\n",
+                     "tb=0x%02X inforce=0x%02X fs=%lu  probe1=x%u probe2=x%u\r\n",
                      (unsigned)ss->ch1.vdiv_idx,
                      (unsigned long)(k1 * 1e6f + 0.5f),
                      (unsigned)ss->ch2.vdiv_idx,
                      (unsigned long)(k2 * 1e6f + 0.5f),
                      (unsigned)ss->timebase_idx, (unsigned)in_force,
-                     (unsigned long)(fs + 0.5f));
+                     (unsigned long)(fs + 0.5f),
+                     (unsigned)(scope_cal_probe_factor(1u) + 0.5f),
+                     (unsigned)(scope_cal_probe_factor(2u) + 0.5f));
     if (in_force != ss->timebase_idx)
         usb_send_str("TB MISMATCH: frequency suppressed (see fpga scope freq)\r\n");
 
@@ -2639,13 +3249,25 @@ static void cmd_fpga_scope_measure(const char *args)
             snprintf(vpp2, sizeof vpp2, "%lu",
                      (unsigned long)((float)m2.pp_robust * k2 * 1e6f + 0.5f));
 
+        /* Edge timing in SAMPLES x100 (M4). "-" when no clean edge was found,
+         * same convention as per1. Kept in samples, not seconds: multiply by
+         * 1/fs on the host when a rate is in force. */
+        char rise[12] = "-", fall[12] = "-";
+        if (m1.rise_valid)
+            snprintf(rise, sizeof rise, "%lu",
+                     (unsigned long)(m1.rise_samples * 100.0f + 0.5f));
+        if (m1.fall_valid)
+            snprintf(fall, sizeof fall, "%lu",
+                     (unsigned long)(m1.fall_samples * 100.0f + 0.5f));
+
         usb_debug_printf("M %2lu pp1=%u ppr1=%u Vpp1_uV=%s Vrms1_uV=%s duty1_pm=%lu "
-                         "per1_smp100=%s f1_mHz=%s pp2=%u Vpp2_uV=%s\r\n",
+                         "per1_smp100=%s f1_mHz=%s rise1_smp100=%s fall1_smp100=%s "
+                         "pp2=%u Vpp2_uV=%s\r\n",
                          (unsigned long)i, (unsigned)m1.pp,
                          (unsigned)m1.pp_robust, vpp1, vrms1,
                          (unsigned long)(m1.level_valid
                                          ? m1.duty_pct * 10.0f + 0.5f : 0.0f),
-                         per, f, (unsigned)m2.pp, vpp2);
+                         per, f, rise, fall, (unsigned)m2.pp, vpp2);
         usb_delay_ms(60);
     }
 }
@@ -2671,8 +3293,8 @@ static void cmd_fpga_scope_cal(void)
 
     for (uint8_t r = 0; r < SCOPE_CAL_RANGE_COUNT; r++) {
         char l1[12], l2[12];
-        scope_cal_range_label(1u, r, l1, sizeof(l1));
-        scope_cal_range_label(2u, r, l2, sizeof(l2));
+        scope_cal_range_label_bnc(1u, r, l1, sizeof(l1));   /* BNC: this is the */
+        scope_cal_range_label_bnc(2u, r, l2, sizeof(l2));   /* cal table        */
 
         const scope_cal_tier_t t = scope_cal_get_tier(1u, r);
         const char *tn = (t == SCOPE_CAL_MEASURED)    ? "measured"
@@ -2690,6 +3312,10 @@ static void cmd_fpga_scope_cal(void)
                          tn);
     }
 
+    usb_debug_printf("table is at the BNC; on-screen volts are at the probe tip: "
+                     "probe CH1 x%u  CH2 x%u\r\n",
+                     (unsigned)(scope_cal_probe_factor(1u) + 0.5f),
+                     (unsigned)(scope_cal_probe_factor(2u) + 0.5f));
     usb_send_str("\r\ntimebase (reg 0x01) -> sample rate\r\n");
     usb_send_str("code    S/s    s/div   tier\r\n");
     for (uint8_t c = 0; c < SCOPE_TIMEBASE_CODE_COUNT; c++) {
@@ -2754,10 +3380,10 @@ static void cmd_fpga_scope_center(const char *args)
         return;
     }
 
-    if (!fpga_acq_pause()) {
-        usb_send_str("ERR: acq task did not park — bus not safe, aborting\r\n");
-        return;
-    }
+    /* Centering runs with the acq task LIVE (it keeps the RAM buffer fresh at
+     * the new DC operating point — see scope_center_buf_median). The servo
+     * touches only the DAC and reads RAM, never SPI3, so there is no bus
+     * contention with the acq task's reads and no need to pause it. */
 
     /* BUGFIX 2026-08-14: the search's scope_trigger_dac_raw() writes were inert
      * without this init (bench: reported means clustered 120-170 regardless of
@@ -2778,17 +3404,20 @@ static void cmd_fpga_scope_center(const char *args)
          * change to a working measurement for no measurable gain. */
         fpga_scope_set_range_diag((uint8_t)r);
         vTaskDelay(pdMS_TO_TICKS(20));     /* relay/frontend settle */
+        scope_center_stale_steps = 0;
         scope_center_one(ch, &dac, &mean);
         /* Name the reference in the output: a bare "center=" line would read
          * identically whichever channel ran, and a mislabelled log is how this
          * project has repeatedly convinced itself of the wrong pin. */
-        usb_debug_printf("CH%u range %lu: center %s=%u (mean=%lu)\r\n",
+        usb_debug_printf("CH%u range %lu: center %s=%u (median=%lu)%s\r\n",
                          (unsigned)ch, (unsigned long)r,
                          (ch == 2) ? "TMR13_C1DT" : "DAC1",
-                         dac, (unsigned long)mean);
+                         dac, (unsigned long)mean,
+                         scope_center_stale_steps
+                             ? "  STALE: no fresh commit on some steps -- result unreliable"
+                             : "");
     }
-
-    fpga_acq_resume();
+    /* acq was never paused (see the note above) — nothing to resume. */
 }
 
 static void cmd_fpga_diag_clear(void)
@@ -2807,6 +3436,49 @@ static void cmd_fpga_bus_release(void)
     usb_send_str("  PB4(MISO) input (FPGA-driven, shared read).\r\n");
     usb_send_str("  PC6=HIGH (SPI en), PB11=HIGH (active), PC9 power-hold kept.\r\n");
     usb_send_str("  ESP32 may now drive SSPI. Re-flash/power-cycle to reclaim.\r\n");
+}
+
+static void cmd_fpga_bus_reacquire(void)
+{
+    fpga_spi3_bus_reacquire();
+    usb_send_str("SPI3 bus REACQUIRED by MCU.\r\n");
+    usb_send_str("  PB3(SCK)/PB5(MOSI) -> SPI3 AF, PB6(CS) -> GPIO out HIGH.\r\n");
+    usb_send_str("  PB4(MISO) input pull-up (stock idle), PC6=HIGH, SPE=1.\r\n");
+    usb_send_str("  Config port left untouched. `fpga reinit` now drives it.\r\n");
+}
+
+/* fpga configbb — run the GPIO bit-bang SSPI config on demand (H7 step 1).
+ * Fires the SAME bit-bang loader coldtrace uses at boot, but from the shell on
+ * guest-bringup-bb, so bit-bang (succeeds) and hardware-SPI (`fpga reinit`, fails)
+ * run from ONE build with identical off-SPI pin state. If bit-bang hits DONE_FINAL
+ * here, the wall is in the SPI3 clocking character (LA-diffable), not off-bus.
+ * Needs a cold/open port (power-cycle first); a successful config CLOSES the port,
+ * so re-run only after another power cycle. */
+static void cmd_fpga_configbb(void)
+{
+#if FPGA_CONFIG_B
+    usb_send_str("bit-bang SSPI config (05-less V0.4 framing) — firing...\r\n");
+    (void)fpga_bitbang_config_sequence();
+    uint32_t sr = ((uint32_t)fpga.cfg_status_reg[0] << 24) |
+                  ((uint32_t)fpga.cfg_status_reg[1] << 16) |
+                  ((uint32_t)fpga.cfg_status_reg[2] << 8) |
+                  (uint32_t)fpga.cfg_status_reg[3];
+    usb_debug_printf("post-upload STATUS(0x41): %02X %02X %02X %02X (raw=%08lX)\r\n",
+                     fpga.cfg_status_reg[0], fpga.cfg_status_reg[1],
+                     fpga.cfg_status_reg[2], fpga.cfg_status_reg[3], sr);
+    usb_debug_printf("  DONE_FINAL(bit13)=%s  flags:%s%s%s%s\r\n",
+                     (sr & (1u << 13)) ? "YES -- CONFIG TOOK" : "no -- the wall",
+                     (sr & (1u << 0))  ? " CRC_ERR" : "",
+                     (sr & (1u << 2))  ? " ID_FAIL" : "",
+                     (sr & (1u << 12)) ? " GWVLD"   : "",
+                     (sr & (1u << 15)) ? " READY"   : "");
+    usb_debug_printf("  close IDCODE(0x11)=%s (silent=port CLOSED=configured)\r\n",
+                     fpga.probe_id_bit_close == 0 ? "0x0120681B ANSWERS (still open)"
+                                                  : "silent/unanchored");
+#else
+    usb_send_str("configbb: not compiled — rebuild with FPGA_CONFIG_B "
+                 "(make guest-bringup-bb)\r\n");
+#endif
 }
 
 static void cmd_fpga_stock_diag(void)
@@ -3020,6 +3692,7 @@ static void cmd_fpga_wire_words(const char *args)
     char *saveptr = NULL;
     char *tok;
     uint32_t value;
+    uint16_t words[48];
     size_t count = 0;
     fpga_diag_snapshot_t before;
 
@@ -3029,18 +3702,30 @@ static void cmd_fpga_wire_words(const char *args)
     }
 
     strcpy(buf, args);
-    fpga_diag_snapshot_take(&before);
 
+    /* Parse the WHOLE list before transmitting any of it. This used to send
+     * each word as it was parsed, so `fpga wire words 0501 0502 oops` drove
+     * two words onto the wire and then printed nothing but a usage line — the
+     * operator reads "syntax error, nothing happened" while the FPGA has been
+     * half-driven. Validate first, then commit. */
     tok = strtok_r(buf, " \t", &saveptr);
     while (tok != NULL) {
+        if (count >= (sizeof(words) / sizeof(words[0]))) {
+            usb_debug_printf("ERR: at most %u words\r\n",
+                             (unsigned)(sizeof(words) / sizeof(words[0])));
+            return;
+        }
         if (parse_int(tok, &value) != 0 || value > 0xFFFF) {
             usb_send_str("Usage: fpga wire words <word1> [word2 ...]\r\n");
             return;
         }
-        fpga_wire_send_word((uint16_t)value, 15);
-        count++;
+        words[count++] = (uint16_t)value;
         tok = strtok_r(NULL, " \t", &saveptr);
     }
+
+    fpga_diag_snapshot_take(&before);
+    for (size_t i = 0; i < count; i++)
+        fpga_wire_send_word(words[i], 15);
 
     usb_debug_printf("Wire words sent: %u\r\n", (unsigned)count);
     fpga_diag_print_delta(&before);
@@ -3224,10 +3909,25 @@ static void cmd_reboot_bootloader(void)
     dfu_request_reboot();
 }
 
+/* One scratch buffer shared by the shell's bus-snapshot commands (`spi3 read`
+ * uses the first half; `spi3 frame` uses both halves for a coherent CH1+CH2
+ * grab). They all run on the single shell task and never nest, so sharing is
+ * safe — and it keeps guest RAM in budget: two per-command 1 KB buffers
+ * overflowed the region by 368 bytes (2ff992c, caught once #31 unblocked the
+ * guest link). One 2 KB buffer costs +1 KB over the old lone snapshot. */
+static uint8_t shell_bus_scratch[2 * FPGA_ADC_BUF_SIZE];
+
 static void cmd_spi3_read(const char *args)
 {
     uint32_t len = 64;
-    if (args && *args) parse_int(args, &len);
+    /* Checked: `spi3 read all` used to set len = 0 and print
+     * "CH1 buffer (0 bytes):" with nothing under it — an empty dump that is
+     * indistinguishable from a genuinely empty capture, from the one command
+     * whose header comment is about exactly that confusion. */
+    if (args && *args && parse_int(args, &len) != 0) {
+        usb_send_str("Usage: spi3 read [len]\r\n");
+        return;
+    }
     if (len > FPGA_ADC_BUF_SIZE) len = FPGA_ADC_BUF_SIZE;
 
     const volatile uint8_t *ch1 = fpga_get_ch1_buf();
@@ -3252,10 +3952,11 @@ static void cmd_spi3_read(const char *args)
      * "a fifth to a half of capture records are torn" as a property of
      * acquisition. It was a property of this loop. Corrected 2026-08-19.
      *
-     * Copy under one pass, then print at leisure. Static rather than stack:
-     * this runs on the shell task and 1 KB is more than it should borrow.
+     * Copy under one pass, then print at leisure. The shared shell scratch
+     * (file scope) rather than the stack: this runs on the shell task and 1 KB
+     * is more than it should borrow.
      */
-    static uint8_t snap[FPGA_ADC_BUF_SIZE];
+    uint8_t *snap = shell_bus_scratch;
     for (uint32_t i = 0; i < len; i++)
         snap[i] = ch1[i];
 
@@ -3265,6 +3966,67 @@ static void cmd_spi3_read(const char *args)
         usb_debug_printf(" %02X", snap[i]);
         if (i % 16 == 15 || i == len - 1) usb_send_str("\r\n");
     }
+}
+
+static void spi3_frame_dump(const char *name, const uint8_t *buf)
+{
+    usb_debug_printf("%s (%u bytes):\r\n", name, (unsigned)FPGA_ADC_BUF_SIZE);
+    for (uint32_t i = 0; i < FPGA_ADC_BUF_SIZE; i++) {
+        if (i % 16 == 0) usb_debug_printf("%04lX:", i);
+        usb_debug_printf(" %02X", buf[i]);
+        if (i % 16 == 15) usb_send_str("\r\n");
+    }
+}
+
+/* spi3 frame — one COHERENT two-channel snapshot of the acquisition buffers,
+ * plus the render-path facts a host needs to reproduce what the screen shows:
+ * the frame generation (proves successive grabs are distinct captures) and
+ * the soft-trigger offset computed by the RENDERER'S OWN code
+ * (scope_ui_soft_trigger_offset), not a host-side replica.
+ *
+ * Coherence: the acq task commits CH1+CH2 atomically under acq_frame_gen
+ * (odd = commit in progress), so a copy bracketed by an unchanged EVEN
+ * generation is one capture on both channels — which is what makes the
+ * CH1-vs-CH2 relative-phase measurement in scripts/exp22_stability.py valid.
+ * Touches RAM only (no SPI3), so acq stays live, same as `spi3 read`. */
+static void cmd_spi3_frame(void)
+{
+    const volatile uint8_t *c1 = fpga_get_ch1_buf();
+    const volatile uint8_t *c2 = fpga_get_ch2_buf();
+    if (!c1 || !c2) {
+        usb_send_str("FPGA not initialized\r\n");
+        return;
+    }
+
+    uint8_t *s1 = shell_bus_scratch;
+    uint8_t *s2 = shell_bus_scratch + FPGA_ADC_BUF_SIZE;
+    uint32_t g0 = 0, g1 = 1;
+    for (uint8_t tries = 0; tries < 8; tries++) {
+        g0 = fpga_acq_frame_generation();
+        if (g0 & 1u) {                      /* mid-commit: wait it out */
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        for (uint32_t i = 0; i < FPGA_ADC_BUF_SIZE; i++) s1[i] = c1[i];
+        for (uint32_t i = 0; i < FPGA_ADC_BUF_SIZE; i++) s2[i] = c2[i];
+        g1 = fpga_acq_frame_generation();
+        if (g1 == g0) break;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    const scope_state_t *ss = scope_state_get();
+    uint8_t src_ch = (ss && ss->trigger.source == TRIG_SRC_CH2) ? 2u : 1u;
+    uint16_t off = scope_ui_soft_trigger_offset((src_ch == 2u) ? s2 : s1);
+
+    usb_debug_printf("FRAME gen=%lu coherent=%u src=CH%u off=%u soft=%u tx=%d anchor=%u ord=%u\r\n",
+                     (unsigned long)g1,
+                     (unsigned)(g1 == g0 && !(g0 & 1u)),
+                     (unsigned)src_ch, (unsigned)off,
+                     (unsigned)(ss ? (ss->soft_trigger ? 1 : 0) : 0),
+                     (int)scope_ui_trig_x_actual(), (unsigned)scope_ui_trig_anchor(),
+                     (unsigned)fpga_acq_record_time_ordered());
+    spi3_frame_dump("CH1", s1);
+    spi3_frame_dump("CH2", s2);
 }
 
 static int32_t scaled_i100(float value)
@@ -3296,18 +4058,41 @@ static void print_i100(const char *label, float value, const char *suffix)
 static const char *meter_layout_name(uint8_t layout)
 {
     switch (layout) {
-    case METER_LAYOUT_FULL:  return "full";
-    case METER_LAYOUT_CHART: return "chart";
-    case METER_LAYOUT_STATS: return "stats";
-    case METER_LAYOUT_FUSE:  return "fuse";
+    case METER_LAYOUT_BIG:    return "big";
+    case METER_LAYOUT_CHART:  return "graph";
+    case METER_LAYOUT_STATS:  return "stats";
+    case METER_LAYOUT_FUSE:   return "fuse";
+    case METER_LAYOUT_LIMITS: return "limits";
     default:                 return "?";
     }
 }
 
 static meter_voltage_wave_snapshot_t usb_meter_wave_snap;
 
+/* One usage line, so every rejection path names the same accepted set. */
+#define MODE_USAGE_LINE \
+    "Usage: mode [scope|0 | meter|1 [submode] [layout] | startup [scope|meter]]\r\n"
+
 static void cmd_mode(const char *args)
 {
+    /* Numeric aliases for the mode keywords.
+     *
+     * `ui.h` declares MODE_OSCILLOSCOPE = 0 and MODE_MULTIMETER = 1, and the
+     * no-argument form of this command prints `current=<number>`, so a bench
+     * script reaching for `mode 0` is reading our own output correctly.  Until
+     * 2026-09-12 that spelling matched none of the keyword branches and fell
+     * out the bottom: no mode change, only a usage line that is easy to miss in
+     * a scripted session.  It voided a bench test.
+     *
+     * Rewrite the leading token onto the keyword path rather than duplicating
+     * the branch bodies, so there stays exactly one implementation per mode.
+     * Only 0 and 1 are accepted: MODE_SIGNAL_GEN and MODE_SETTINGS have no
+     * frontend transition here, and inventing one silently would be the same
+     * defect wearing a different hat.  Anything else still reaches the usage
+     * line below, which now names the numeric forms. */
+    char alias_buf[56];
+    const char *as_typed = args;
+
     if (args == NULL || *args == '\0') {
         usb_debug_printf("current=%lu startup=%s meter_submode=%u (%s) layout=%u (%s)\r\n",
                          (uint32_t)current_mode,
@@ -3317,6 +4102,27 @@ static void cmd_mode(const char *args)
                          (unsigned)meter_layout,
                          meter_layout_name(meter_layout));
         return;
+    }
+
+    {
+        size_t tok_len = 0;
+        const char *keyword = NULL;
+
+        while (args[tok_len] != '\0' && args[tok_len] != ' ' && args[tok_len] != '\t')
+            tok_len++;
+
+        if (tok_len == 1 && args[0] == '0') keyword = "scope";
+        else if (tok_len == 1 && args[0] == '1') keyword = "meter";
+
+        if (keyword != NULL) {
+            if (strlen(keyword) + strlen(args + tok_len) >= sizeof(alias_buf)) {
+                usb_send_str(MODE_USAGE_LINE);
+                return;
+            }
+            strcpy(alias_buf, keyword);
+            strcat(alias_buf, args + tok_len);
+            args = alias_buf;
+        }
     }
 
     if (strcmp(args, "scope") == 0) {
@@ -3397,7 +4203,8 @@ static void cmd_mode(const char *args)
         return;
     }
 
-    usb_send_str("Usage: mode [scope|meter [submode] [layout]|startup [scope|meter]]\r\n");
+    usb_debug_printf("mode: unrecognised argument '%s'\r\n", as_typed);
+    usb_send_str(MODE_USAGE_LINE);
 }
 
 static void cmd_meter_dump(const char *args)
@@ -4490,7 +5297,14 @@ static void cmd_meter_mux_arms(const char *args)
     }
 
     vTaskDelay(pdMS_TO_TICKS(settle_ms));
-    (void)fpga_send_cmd(0x05, FPGA_CMD_METER_START);
+    /* UNOBEYED: an obeyed 0x0509 moves the SoC's display state, and this
+     * trace is about the relays, not about commanding the meter.
+     * Reported, not discarded: this only ENQUEUES, and if the TX queue is
+     * full the START frame never goes out, so the trace below would read
+     * as "the hardware did not answer" rather than "we never asked". */
+    if (fpga_send_cmd_unobeyed(0x05, FPGA_CMD_METER_START) != pdTRUE)
+        usb_send_str("WARN: METER_START not queued (TX queue full) — the trace"
+                     " below is NOT a response to it\r\n");
     vTaskDelay(pdMS_TO_TICKS(350));
 
     usb_send_str("=== DMM Mux Arms Trace ===\r\n");
@@ -4530,7 +5344,14 @@ static void cmd_meter_boot_sequence(const char *args)
     }
 
     vTaskDelay(pdMS_TO_TICKS(settle_ms));
-    (void)fpga_send_cmd(0x05, FPGA_CMD_METER_START);
+    /* UNOBEYED: an obeyed 0x0509 moves the SoC's display state, and this
+     * trace is about the relays, not about commanding the meter.
+     * Reported, not discarded: this only ENQUEUES, and if the TX queue is
+     * full the START frame never goes out, so the trace below would read
+     * as "the hardware did not answer" rather than "we never asked". */
+    if (fpga_send_cmd_unobeyed(0x05, FPGA_CMD_METER_START) != pdTRUE)
+        usb_send_str("WARN: METER_START not queued (TX queue full) — the trace"
+                     " below is NOT a response to it\r\n");
     vTaskDelay(pdMS_TO_TICKS(350));
 
     usb_send_str("=== DMM Boot-Order Trace ===\r\n");
@@ -4557,8 +5378,16 @@ static void cmd_meter_pc11_timing(const char *args)
         char *saveptr = NULL;
         char *tok;
 
-        strncpy(buf, args, sizeof(buf) - 1);
-        buf[sizeof(buf) - 1] = '\0';
+        /* Guard the copy. strncpy() truncates silently, so an over-long
+         * argument lost its tail BEFORE the trailing-token rejection below
+         * could see it — the guard existed but could be walked around. Both
+         * sibling parsers (parse_stream_args, parse_mux_arm_args) already
+         * check this. */
+        if (strlen(args) >= sizeof(buf)) {
+            usb_send_str(usage);
+            return;
+        }
+        strcpy(buf, args);
         tok = strtok_r(buf, " \t", &saveptr);
         if (tok != NULL &&
             (parse_int(tok, &low_ms) != 0 || low_ms > 5000U)) {
@@ -4590,7 +5419,14 @@ static void cmd_meter_pc11_timing(const char *args)
     }
 
     vTaskDelay(pdMS_TO_TICKS(high_ms));
-    (void)fpga_send_cmd(0x05, FPGA_CMD_METER_START);
+    /* UNOBEYED: an obeyed 0x0509 moves the SoC's display state, and this
+     * trace is about the relays, not about commanding the meter.
+     * Reported, not discarded: this only ENQUEUES, and if the TX queue is
+     * full the START frame never goes out, so the trace below would read
+     * as "the hardware did not answer" rather than "we never asked". */
+    if (fpga_send_cmd_unobeyed(0x05, FPGA_CMD_METER_START) != pdTRUE)
+        usb_send_str("WARN: METER_START not queued (TX queue full) — the trace"
+                     " below is NOT a response to it\r\n");
     vTaskDelay(pdMS_TO_TICKS(350));
 
     usb_send_str("=== DMM PC11 Timing Trace ===\r\n");
@@ -4993,8 +5829,22 @@ static bool spi3_shell_claim(void)
     return true;
 }
 
+/* The 14 arm commands below only ENQUEUE. Their return was discarded, so a
+ * full TX queue produced a complete, plausible, entirely meaningless test
+ * report. Count the failures and say so. */
+static uint32_t acqtest_enq_fails;
+static void acqtest_send(uint8_t hi, uint8_t lo)
+{
+    /* UNOBEYED (00 00). These are FPGA-side scope words; with the AA 55 header
+     * on, an obeyed 0x00xx frame's effect on the meter SoC is unmeasured, and
+     * this test is about SPI3. The enqueue result is still counted, so a full
+     * TX queue cannot masquerade as "the hardware did not answer". */
+    if (fpga_send_cmd_unobeyed(hi, lo) != pdTRUE) acqtest_enq_fails++;
+}
+
 static void cmd_spi3_acqtest(void)
 {
+    acqtest_enq_fails = 0;
     usb_send_str("=== SPI3 Acquisition Path Test (Decomposer Phase 20) ===\r\n\r\n");
 
     /* --- State report --- */
@@ -5051,9 +5901,19 @@ static void cmd_spi3_acqtest(void)
 
     /* --- Test 3: USART2 scope-arm then SPI3 read --- */
     usb_send_str("\r\n-- T3: USART2 arm (0x20,0x21) → SPI3 read --\r\n");
-    fpga_send_cmd(0x00, 0x20);  /* Scope timebase cmd */
+    /* T3 and T4 are only measurements if the arm words can actually leave
+     * PA2. On a USART-silent build they cannot, and their "no non-FF" result
+     * is then a statement about this firmware, not about the FPGA. */
+    {
+        uint32_t c1 = fpga_usart_ctrl1();
+        if (!(((c1 >> 13) & 1u) && ((c1 >> 3) & 1u)))
+            usb_debug_printf("WARN: USART2 is dark (CTRL1=%08lX) — T3/T4 arm words cannot\r\n"
+                             "      leave PA2. Their results are NOT measurements. `fpga usart on` first.\r\n",
+                             (unsigned long)c1);
+    }
+    acqtest_send(0x00, 0x20);  /* Scope timebase cmd */
     vTaskDelay(pdMS_TO_TICKS(30));
-    fpga_send_cmd(0x00, 0x21);  /* Scope trigger mode cmd */
+    acqtest_send(0x00, 0x21);  /* Scope trigger mode cmd */
     vTaskDelay(pdMS_TO_TICKS(30));
 
     usb_debug_printf("PC0 after arm: %d\r\n", (GPIOC->idt & (1 << 0)) ? 1 : 0);
@@ -5071,18 +5931,18 @@ static void cmd_spi3_acqtest(void)
     /* --- Test 4: Full stock scope entry (0x01..0x08, 0x0B..0x11, 0x20, 0x21) --- */
     usb_send_str("\r\n-- T4: Full scope entry → SPI3 read --\r\n");
     /* Reset sequence */
-    fpga_send_cmd(0x00, 0x01);  vTaskDelay(pdMS_TO_TICKS(10));
-    fpga_send_cmd(0x00, 0x02);  vTaskDelay(pdMS_TO_TICKS(10));
-    fpga_send_cmd(0x00, 0x03);  vTaskDelay(pdMS_TO_TICKS(10));
-    fpga_send_cmd(0x00, 0x0B);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH1 gain */
-    fpga_send_cmd(0x00, 0x0C);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH1 offset */
-    fpga_send_cmd(0x00, 0x0D);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH2 gain */
-    fpga_send_cmd(0x00, 0x0E);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH2 offset */
-    fpga_send_cmd(0x00, 0x0F);  vTaskDelay(pdMS_TO_TICKS(10));  /* Coupling */
-    fpga_send_cmd(0x00, 0x10);  vTaskDelay(pdMS_TO_TICKS(10));  /* Trigger */
-    fpga_send_cmd(0x00, 0x11);  vTaskDelay(pdMS_TO_TICKS(10));  /* Timebase */
-    fpga_send_cmd(0x00, 0x20);  vTaskDelay(pdMS_TO_TICKS(10));  /* Acq mode */
-    fpga_send_cmd(0x00, 0x21);  vTaskDelay(pdMS_TO_TICKS(50));  /* Trigger arm */
+    acqtest_send(0x00, 0x01);  vTaskDelay(pdMS_TO_TICKS(10));
+    acqtest_send(0x00, 0x02);  vTaskDelay(pdMS_TO_TICKS(10));
+    acqtest_send(0x00, 0x03);  vTaskDelay(pdMS_TO_TICKS(10));
+    acqtest_send(0x00, 0x0B);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH1 gain */
+    acqtest_send(0x00, 0x0C);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH1 offset */
+    acqtest_send(0x00, 0x0D);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH2 gain */
+    acqtest_send(0x00, 0x0E);  vTaskDelay(pdMS_TO_TICKS(10));  /* CH2 offset */
+    acqtest_send(0x00, 0x0F);  vTaskDelay(pdMS_TO_TICKS(10));  /* Coupling */
+    acqtest_send(0x00, 0x10);  vTaskDelay(pdMS_TO_TICKS(10));  /* Trigger */
+    acqtest_send(0x00, 0x11);  vTaskDelay(pdMS_TO_TICKS(10));  /* Timebase */
+    acqtest_send(0x00, 0x20);  vTaskDelay(pdMS_TO_TICKS(10));  /* Acq mode */
+    acqtest_send(0x00, 0x21);  vTaskDelay(pdMS_TO_TICKS(50));  /* Trigger arm */
 
     usb_debug_printf("PC0 after full entry: %d\r\n", (GPIOC->idt & (1 << 0)) ? 1 : 0);
 
@@ -5123,6 +5983,10 @@ static void cmd_spi3_acqtest(void)
     usb_debug_printf("DMA2_SRCSEL0: 0x%08lX\r\n", *dma2_srcsel0);
     usb_debug_printf("DMA2_SRCSEL1: 0x%08lX\r\n", *dma2_srcsel1);
 
+    if (acqtest_enq_fails)
+        usb_debug_printf("WARN: %lu of 14 arm commands were NOT queued (TX queue full) — the\r\n"
+                         "      T3/T4 results above are not a test of what you think.\r\n",
+                         (unsigned long)acqtest_enq_fails);
     usb_send_str("\r\n=== Done. Non-FF in any test = FPGA responding on SPI3 ===\r\n");
 }
 
@@ -5278,12 +6142,24 @@ static void cmd_spi3_xfer(const char *args)
     for (uint32_t i = 0; i < n; i++) usb_debug_printf(" %02X", tx[i]);
     usb_send_str("\r\nMISO:");
     uint32_t nonff = 0;
+    uint32_t timeouts = 0;
     for (uint32_t i = 0; i < n; i++) {
         usb_debug_printf(" %02X", rx[i]);
         if (rx[i] != 0xFF) nonff++;
+        /* spi3_raw_xfer() returns 0xEE on a TXE/RXNE timeout. It is NOT a
+         * reply, and it was being counted as one: on a hung bus this printed
+         * "non-FF: 1/1", i.e. the exact positive signal this command exists to
+         * detect. Every other counter in this file already excludes 0xEE. The
+         * nonff figure is left alone (bench notes quote it); the timeouts are
+         * reported alongside it so the number can be read honestly. */
+        if (rx[i] == 0xEE) timeouts++;
     }
-    usb_debug_printf("\r\nnon-FF: %lu/%lu  PC0 %lu->%lu\r\n",
-                     (unsigned long)nonff, (unsigned long)n, pc0_before, pc0_after);
+    usb_debug_printf("\r\nnon-FF: %lu/%lu  timeouts(0xEE): %lu  PC0 %lu->%lu\r\n",
+                     (unsigned long)nonff, (unsigned long)n,
+                     (unsigned long)timeouts, pc0_before, pc0_after);
+    if (timeouts)
+        usb_send_str("WARN: 0xEE is the SPI3 timeout sentinel, not FPGA data — "
+                     "treat the non-FF count as unproven\r\n");
 }
 
 /* spi3 acqread — read one acquisition frame per channel using the REAL
@@ -5444,7 +6320,20 @@ static void cmd_spi3_opread(const char *args)
             return;
         }
         tok = strtok_r(NULL, " \t", &saveptr);
-        if (tok && strcmp(tok, "dump") == 0) dump = true;
+        /* An unrecognised third token used to be swallowed: the window ran
+         * with dump=false and the operator read "stats only" as an empty
+         * dump rather than a rejected argument. */
+        if (tok) {
+            if (strcmp(tok, "dump") != 0) {
+                usb_debug_printf("ERR: expected 'dump', got '%s'\r\n", tok);
+                return;
+            }
+            dump = true;
+            if (strtok_r(NULL, " \t", &saveptr) != NULL) {
+                usb_send_str("ERR: too many arguments. Usage: spi3 opread <op> [len [dump]]\r\n");
+                return;
+            }
+        }
     }
 
     if (!fpga_acq_pause()) {
@@ -5680,6 +6569,40 @@ static void cmd_spi3_gowin(void)
                  "  The /2 pass is expected to be garbage; it is the negative control.\r\n");
 }
 
+/* spi3 edgecap [reps] — EXP-37 LA edge-capture. Emits [reps] identical 0x15
+ * CONFIG_ENABLE frames over AF hardware-SPI3 (/256), a 60ms gap, then [reps] over
+ * GPIO bit-bang — same pins/rate/frame, drive type the only variable. Isolated
+ * frames; does NOT configure. Arm sigrok (D0=SCK/D1=MISO/D2=MOSI/D3=CS) BEFORE
+ * running, then diff the two bursts.
+ *
+ * The rig needs the bit-bang transport, which only exists under FPGA_CONFIG_B.
+ * The command stays in the table on every build and says so, rather than
+ * disappearing from `help` and leaving the operator guessing. */
+static void cmd_spi3_edgecap(const char *args)
+{
+#if !FPGA_CONFIG_B
+    (void)args;
+    usb_send_str("edgecap: FPGA_CONFIG_B builds only — the GPIO bit-bang half is not"
+                 " compiled here. Flash `make guest-bringup-bb`.\r\n");
+#else
+    uint32_t reps = 16;
+    /* parse_int(), not a bare strtoul(): a non-numeric argument used to become
+     * 0 and then be clamped back to the default, so the command silently ran
+     * something other than what was typed. Numeric out-of-range still clamps,
+     * as it always has. */
+    if (args && *args && parse_int(args, &reps) != 0) {
+        usb_send_str("Usage: spi3 edgecap [reps]\r\n");
+        return;
+    }
+    if (reps == 0 || reps > 255) reps = 16;
+    usb_debug_printf("edgecap: %lu AF 0x15 frames (/256), 60ms gap, %lu bit-bang 0x15 frames\r\n",
+                     reps, reps);
+    usb_send_str("  emitting now — capture window should be armed on D0=SCK D1=MISO D2=MOSI D3=CS\r\n");
+    fpga_edgecap_15((uint8_t)reps);
+    usb_send_str("edgecap: done. AF burst | gap | GPIO burst are in the capture.\r\n");
+#endif
+}
+
 /* ─── fpga selftest ────────────────────────────────────────────────────────
  *
  * ONE precondition table, printed before an experiment, so the instrument is
@@ -5797,7 +6720,17 @@ static void cmd_fpga_selftest(void)
 static void cmd_spi3_scopetest(const char *args)
 {
     uint8_t bank = 0;
-    if (args && *args) bank = (uint8_t)strtoul(args, NULL, 0);
+    /* parse_int(), not a bare strtoul(): `spi3 scopetest ch2` used to run
+     * bank 0 and print "(bank=0)" — an experiment on the wrong bank, labelled
+     * plausibly. */
+    if (args && *args) {
+        uint32_t v;
+        if (parse_int(args, &v) != 0 || v > 0xFF) {
+            usb_send_str("Usage: spi3 scopetest [bank]\r\n");
+            return;
+        }
+        bank = (uint8_t)v;
+    }
 
     usb_send_str("=== scope test: USART scope-cfg -> PC0 wait -> 0x04/0x05 ===\r\n");
     usb_debug_printf("PB11(active)=%d PC6(spi_en)=%d PC0(rdy)=%d before cfg\r\n",
@@ -6113,6 +7046,14 @@ static void cmd_fpga_dbgarm(const char *args)
  * Defaults match the stock-captured timing: br=0 (/2), gap=100ms, close=600ms. */
 static void cmd_fpga_reinit(const char *args)
 {
+    /* guest-bringup leaves the bus released (PB3/5/6 Hi-Z, SPE off). reinit means
+     * "take the bus and configure", so reacquire it first — otherwise the whole
+     * handshake clocks into a dead wire (H7, 2026-08-26). No-op on other builds. */
+    if (fpga.bus_released) {
+        fpga_spi3_bus_reacquire();
+        usb_send_str("reinit: bus was released -> reacquired SPI3 (PB3/4/5/6, SPE)\r\n");
+    }
+
     fpga_cfg_seq_opts_t opt = {
         .upload_br = 0, .prelude_gap_ms = 100, .post_close_ms = 600, .arm_pb11 = 1,
         .reset_port = 0, .reset_pin = 0, .reset_low_ms = 10,
@@ -6128,39 +7069,73 @@ static void cmd_fpga_reinit(const char *args)
         char *t0 = strtok_r(buf, " \t", &save);
         char *t1 = t0 ? strtok_r(NULL, " \t", &save) : NULL;
         char *t2 = t1 ? strtok_r(NULL, " \t", &save) : NULL;
-        if (t0) opt.upload_br      = (uint32_t)strtoul(t0, NULL, 0);
-        if (t1) opt.prelude_gap_ms = (uint32_t)strtoul(t1, NULL, 0);
-        if (t2) opt.post_close_ms  = (uint32_t)strtoul(t2, NULL, 0);
+        /* Every number below is parse_int()-checked. Bare strtoul() used to
+         * turn an unparseable token into 0 SILENTLY, which on this command is
+         * the worst possible failure: `fpga reinit slow` discarded all three
+         * stock-captured defaults (br=0/gap=100/close=600), ran a different
+         * handshake, and echoed "br=0 gap=0ms close=0ms" as though that were
+         * what was asked for. 0 is a legal value, so the echo could not
+         * disambiguate it. This is a sweep tool; a typo must not quietly
+         * become a data point. */
+        if ((t0 && parse_int(t0, &opt.upload_br) != 0) ||
+            (t1 && parse_int(t1, &opt.prelude_gap_ms) != 0) ||
+            (t2 && parse_int(t2, &opt.post_close_ms) != 0)) {
+            usb_send_str("ERR: br/gap/close must be numbers. See `help`.\r\n");
+            return;
+        }
         /* Remaining tokens are optional, order-independent, prefix-classified:
          *   a..e<pin> = FPGA reset pulse pin (e.g. b9)
          *   f<0|1|2>  = prelude frame mode (split/combined/merge)
          *   u<ms>     = pre-upload digest gap after CONFIG_ENABLE */
         for (char *tk = strtok_r(NULL, " \t", &save); tk;
              tk = strtok_r(NULL, " \t", &save)) {
+            uint32_t n;
             if (tk[0] >= 'a' && tk[0] <= 'e' && tk[1]) {   /* <port><pin> */
+                if (parse_int(tk + 1, &n) != 0 || n > 15u) goto reinit_bad_token;
                 opt.reset_port = (uint8_t)(tk[0] - 'a' + 1);
-                opt.reset_pin  = (uint8_t)strtoul(tk + 1, NULL, 10);
+                opt.reset_pin  = (uint8_t)n;
             } else if (tk[0] == 'f') {
-                opt.prelude_frame_mode = (uint8_t)strtoul(tk + 1, NULL, 10);
+                if (parse_int(tk + 1, &n) != 0 || n > 2u) goto reinit_bad_token;
+                opt.prelude_frame_mode = (uint8_t)n;
             } else if (tk[0] == 'u') {
-                opt.pre_upload_gap_ms = (uint32_t)strtoul(tk + 1, NULL, 0);
+                if (parse_int(tk + 1, &n) != 0) goto reinit_bad_token;
+                opt.pre_upload_gap_ms = n;
             } else if (tk[0] == 'k') {  /* 'k' (clock) — NOT 'c', which collides
                                          * with reset-port c (a..e) above */
-                opt.cmd_br = (uint32_t)strtoul(tk + 1, NULL, 0);
-            } else if (tk[0] == 's') {  /* strap-hold: s2[h|l]=PD2, sd[h|l]=PD12+13
-                                         * (default HIGH = stock). GPIO-audit lead. */
+                if (parse_int(tk + 1, &n) != 0 || n > 7u) goto reinit_bad_token;
+                opt.cmd_br = n;
+            } else if (tk[0] == 's' && tk[1] != '\0') {
+                                        /* strap-hold: s2[h|l]=PD2, sd[h|l]=PD12+13
+                                         * (default HIGH = stock). GPIO-audit lead.
+                                         * sb = single-BR (EXP-34): no SPE toggle
+                                         * through the config transaction.
+                                         * tk[1] is tested first now: reading tk[2]
+                                         * on a bare "s" ran off the end of the
+                                         * token. */
                 uint8_t lvl = (tk[2] == 'l') ? 2 : 1;
                 if (tk[1] == '2')      opt.strap_pd2    = lvl;
                 else if (tk[1] == 'd') opt.strap_pd1213 = lvl;
+                else if (tk[1] == 'b') opt.single_br    = 1;
+                else goto reinit_bad_token;
             } else if (tk[0] == 't' && tk[1] == 'c') {  /* tc<N> = trailing clocks
                                          * after bitstream, before 0x3A (sibling ~200) */
-                opt.trailing_clocks = (uint16_t)strtoul(tk + 2, NULL, 0);
-            } else if (tk[0] == 'p' && tk[1] == 'e') {  /* pe = probe SYSTEM_EDIT_MODE:
+                if (parse_int(tk + 2, &n) != 0 || n > 0xFFFFu) goto reinit_bad_token;
+                opt.trailing_clocks = (uint16_t)n;
+            } else if (strcmp(tk, "pe") == 0) {  /* pe = probe SYSTEM_EDIT_MODE:
                                          * read STATUS at /256 right after 0x15 */
                 opt.probe_edit = 1;
-            } else if (tk[0] == 'r' && tk[1] == 'l') {  /* rl = send 0x3C RELOAD before
+            } else if (strcmp(tk, "rl") == 0) {  /* rl = send 0x3C RELOAD before
                                          * the prelude (software reconfig trigger) */
                 opt.reload_3c = 1;
+            } else {
+                /* No silent drop. The chain used to end here with nothing, so a
+                 * mistyped sweep option ran the BASELINE handshake and reported
+                 * success — and got written down as a data point for a
+                 * parameter that was never applied. */
+reinit_bad_token:
+                usb_debug_printf("ERR: unknown or malformed reinit option '%s' — "
+                                 "nothing was sent. See `help`.\r\n", tk);
+                return;
             }
         }
     }
@@ -6183,6 +7158,8 @@ static void cmd_fpga_reinit(const char *args)
     if (opt.trailing_clocks)
         usb_debug_printf("reinit: trailing_clocks=%u (after bitstream, before 0x3A)\r\n",
                          opt.trailing_clocks);
+    if (opt.single_br)
+        usb_send_str("reinit: SINGLE-BR — no spi3_set_br/SPE toggle through the transaction (EXP-34)\r\n");
 
     uint8_t close = fpga_spi3_config_sequence(&opt);
 
@@ -6397,7 +7374,8 @@ static void cmd_spi3_probe(void)
     timeout = 100000;
     while (!(*spi_sts & 0x01) && --timeout);  /* Wait RXNE */
     uint8_t rx = (uint8_t)*spi_dt;
-    usb_debug_printf("SPI3 xfer(0x00) = 0x%02X (timeout=%lu)\r\n", rx, timeout);
+    usb_debug_printf("SPI3 xfer(0x00) = 0x%02X (timeout=%lu)%s\r\n", rx, timeout,
+                     timeout ? "" : "  <-- RXNE TIMED OUT: byte is stale, not a reply");
 
     /* Send 0x05 (FPGA query cmd) */
     timeout = 100000;
@@ -6406,7 +7384,8 @@ static void cmd_spi3_probe(void)
     timeout = 100000;
     while (!(*spi_sts & 0x01) && --timeout);
     rx = (uint8_t)*spi_dt;
-    usb_debug_printf("SPI3 xfer(0x05) = 0x%02X (timeout=%lu)\r\n", rx, timeout);
+    usb_debug_printf("SPI3 xfer(0x05) = 0x%02X (timeout=%lu)%s\r\n", rx, timeout,
+                     timeout ? "" : "  <-- RXNE TIMED OUT: byte is stale, not a reply");
 
     /* Send another 0x00 */
     timeout = 100000;
@@ -6415,7 +7394,8 @@ static void cmd_spi3_probe(void)
     timeout = 100000;
     while (!(*spi_sts & 0x01) && --timeout);
     rx = (uint8_t)*spi_dt;
-    usb_debug_printf("SPI3 xfer(0x00) = 0x%02X (timeout=%lu)\r\n", rx, timeout);
+    usb_debug_printf("SPI3 xfer(0x00) = 0x%02X (timeout=%lu)%s\r\n", rx, timeout,
+                     timeout ? "" : "  <-- RXNE TIMED OUT: byte is stale, not a reply");
 
     /* Deassert CS */
     GPIOB->scr = (1 << 6);
@@ -6454,6 +7434,385 @@ static void cmd_spi3_probe(void)
  * string, CMD_V if it takes void). Help is part of the row; keep the
  * left-aligned name+argspec column at 32 chars like the rows around it.
  * ═══════════════════════════════════════════════════════════════════ */
+/* ── fwload / fwstat / fwapply — image loading over this shell ──────────
+ * The state machine and every flash touch live in fw_loader.c; these
+ * handlers are parsing and printing only. The RX rerouting that feeds the
+ * transfer is in vUsbDebugTask below. */
+
+static const char *fwl_err_name(fw_loader_error_t e)
+{
+    switch (e) {
+    case FW_LOADER_ERR_NONE:    return "none";
+    case FW_LOADER_ERR_SIZE:    return "size (need even 8192..757760)";
+    case FW_LOADER_ERR_FLASH:   return "w25q erase/write/read";
+    case FW_LOADER_ERR_CRC:     return "crc mismatch";
+    case FW_LOADER_ERR_VECTOR:  return "vector table not app-shaped";
+    case FW_LOADER_ERR_TIMEOUT: return "rx went silent; run fwload again";
+    case FW_LOADER_ERR_NO_IMAGE: return "slot holds no valid image";
+    case FW_LOADER_ERR_NO_BUFFER: return "no scratch attached (shell task bug)";
+    }
+    return "?";
+}
+
+static void fwl_print_status(void)
+{
+    static const char *names[] = { "IDLE", "RECEIVING", "STAGED", "ERROR" };
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+             "fwload: %s slot=%c %lu/%lu crc=%08lX err=%s\r\n"
+             "cache:  A=%lu/%08lX B=%lu/%08lX\r\n",
+             names[fw_loader_state()],
+             fw_loader_slot() ? 'b' : 'a',
+             (unsigned long)fw_loader_bytes(),
+             (unsigned long)fw_loader_expected(),
+             (unsigned long)fw_loader_crc_announced(),
+             fwl_err_name(fw_loader_error()),
+             (unsigned long)fw_loader_slot_size(0), (unsigned long)fw_loader_slot_crc(0),
+             (unsigned long)fw_loader_slot_size(1), (unsigned long)fw_loader_slot_crc(1));
+    usb_send_str(buf);
+    const fwl_breadcrumb_t *bc = fw_loader_breadcrumb_last();
+    if (bc->present)
+        usb_debug_printf("last install: %s (code %u)%s, page 0x%08lX, flash sts 0x%04X\r\n",
+                         fw_loader_breadcrumb_name(bc->code), (unsigned)bc->code,
+                         bc->spi2_stall ? ", SPI2 reclaim timed out" : "",
+                         (unsigned long)bc->addr, (unsigned)bc->sts);
+    else
+        usb_send_str("last install: no record since power-up (none, or the board lost power)\r\n");
+}
+
+static void cmd_fwload(const char *args)
+{
+    char *end = NULL;
+    unsigned long size = strtoul(args, &end, 10);
+    char *end2 = NULL;
+    bool crc_bad = false;
+    unsigned long crc = 0;
+    if (end && *end) {
+        crc = strtoul(end, &end2, 16);
+        /* strtoul() leaves endptr == nptr when it converted nothing, so this
+         * separates "crc32 token is not hex" from "crc32 is literally 0" and
+         * from "no crc32 given" — all three used to print the same usage
+         * line, which sends the operator hunting a syntax error they do not
+         * have. */
+        if (end2 == end) crc_bad = true;
+    }
+    uint8_t slot = 1; /* default: slot b — "the other firmware" by custom */
+    bool slot_bad = false;
+    if (end2 != NULL) {
+        while (*end2 == ' ') end2++;
+        if (*end2 == 'a' || *end2 == 'A') slot = 0;
+        else if (*end2 == 'b' || *end2 == 'B') slot = 1;
+        else if (*end2 != '\0') slot_bad = true;
+        /* The letter must END the argument. `fwload 8192 DEADBEEF apple`
+         * matched 'a', dropped "pple" and armed the raw-byte intake — the
+         * same wedge the comment below describes, reached through the
+         * recognised-letter door instead of the unrecognised one. */
+        if (!slot_bad && *end2 != '\0') {
+            const char *tail = end2 + 1;
+            while (*tail == ' ') tail++;
+            if (*tail != '\0') slot_bad = true;
+        }
+    }
+    /* An argument that is present but is neither a nor b used to fall back to
+     * the default and arm the intake anyway: `fwload <size> <crc> c` put the
+     * shell into raw mode while the operator was still reading the reply, and
+     * the next line they typed went into the image instead of the parser.
+     * (Wedged the 2C23T port that way on 2026-08-24 — same parser, same trap.)
+     * Refusing costs nothing: cdc_flash.py never sends anything but a or b. */
+    if (crc_bad) {
+        /* Checked before slot_bad: an unparseable crc32 leaves end2 pointing at
+         * that same token, which can then be mis-blamed on the slot letter. */
+        usb_send_str("fwload: ERROR crc32 must be hex\r\n");
+        return;
+    }
+    if (slot_bad) {
+        usb_send_str("fwload: ERROR slot must be exactly a or b\r\n");
+        return;
+    }
+    if (end == args || crc == 0) {
+        usb_send_str("usage: fwload <size bytes, decimal> <crc32 hex> [a|b]\r\n"
+                     "       then stream exactly that many raw bytes\r\n");
+        return;
+    }
+    if (!fw_loader_begin((uint32_t)size, (uint32_t)crc, slot)) {
+        fwl_print_status();
+        return;
+    }
+    char buf[72];
+    snprintf(buf, sizeof(buf), "GO %lu bytes to slot %c, crc %08lX expected\r\n",
+             size, slot ? 'b' : 'a', crc);
+    usb_send_str(buf);
+}
+
+static void cmd_fwstat(void)
+{
+    fwl_print_status();
+}
+
+static void cmd_fwswap(const char *args)
+{
+    uint8_t slot;
+    while (*args == ' ') args++;
+    /* The token must be exactly one letter. A first-character match meant
+     * `fwswap apple` and `fwswap b0rked` both reached erase+program+system
+     * reset — the most destructive command in this shell, accepting the
+     * loosest argument in it. */
+    const char *sw_tail = (*args != '\0') ? args + 1 : args;
+    while (*sw_tail == ' ') sw_tail++;
+    if (*sw_tail != '\0') slot = 0xFF;
+    else if (*args == 'a' || *args == 'A') slot = 0;
+    else if (*args == 'b' || *args == 'B') slot = 1;
+    else slot = 0xFF;
+    if (slot == 0xFF) {
+        usb_send_str("usage: fwswap a|b   (install a cached image, no transfer)\r\n");
+        fwl_print_status();
+        return;
+    }
+    usb_send_str("verifying slot, then: erase+program+verify from RAM and\r\n"
+                 "SYSTEM RESET into the image. keep USB attached (it carries\r\n"
+                 "the rail through the reset). recovery = hold MENU through\r\n"
+                 "a pinhole reset (IAP), not MENU+Power.\r\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    if (!fw_loader_install_slot(slot)) {
+        fwl_print_status();
+    }
+}
+
+static void cmd_fwapply(void)
+{
+    if (fw_loader_state() != FW_LOADER_STAGED) {
+        usb_send_str("nothing staged — fwload first (or fwswap a|b)\r\n");
+        fwl_print_status();
+        return;
+    }
+    usb_send_str("applying: erase+program+verify from RAM, then SYSTEM RESET\r\n"
+                 "into the new image (a clean boot, not a jump). this port\r\n"
+                 "drops now. keep USB attached — it carries the rail through\r\n"
+                 "the reset. recovery = hold MENU through a pinhole reset\r\n"
+                 "(IAP), not MENU+Power.\r\n");
+    vTaskDelay(pdMS_TO_TICKS(300));   /* let the goodbye reach the host */
+    if (!fw_loader_apply()) {
+        fwl_print_status();           /* only reached on a refused apply */
+    }
+}
+
+/* `btn <name> [n]` — inject a button press into the input queue, downstream
+ * of the TMR3 key scan, so a bench script can drive the UI exactly as the
+ * buttons do. POWER is refused: its handlers shut the device down or reset
+ * into the factory IAP bootloader. */
+static void cmd_btn(const char *args)
+{
+    static const struct { const char *name; button_id_t id; } names[] = {
+        {"ch1", BTN_CH1}, {"ch2", BTN_CH2}, {"move", BTN_MOVE}, {"select", BTN_SELECT},
+        {"trigger", BTN_TRIGGER}, {"prm", BTN_PRM}, {"auto", BTN_AUTO}, {"save", BTN_SAVE},
+        {"menu", BTN_MENU}, {"up", BTN_UP}, {"down", BTN_DOWN}, {"left", BTN_LEFT},
+        {"right", BTN_RIGHT}, {"ok", BTN_OK},
+    };
+    while (*args == ' ') args++;
+    size_t len = 0;
+    while (args[len] && args[len] != ' ') len++;
+    uint32_t n = 1;
+    if (args[len] == ' ') {
+        const char *p = args + len;
+        while (*p == ' ') p++;
+        if (*p && (parse_int(p, &n) != 0 || n == 0 || n > 50)) n = 0;
+    }
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (len == strlen(names[i].name) && strncmp(args, names[i].name, len) == 0 && n) {
+            unsigned sent = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                if (input_inject_button(names[i].id)) sent++;
+                vTaskDelay(pdMS_TO_TICKS(150));   /* let each press be handled */
+            }
+            usb_debug_printf("btn %s: %u/%lu queued\r\n", names[i].name, sent, (unsigned long)n);
+            return;
+        }
+    }
+    usb_send_str("usage: btn ch1|ch2|move|select|trigger|prm|auto|save|menu|up|down|left|right|ok [1..50]\r\n"
+                 "(power is refused: it shuts down or enters IAP)\r\n");
+}
+
+/* ── `mask` — waveform pass/fail (docs/specs/scope/mask-pass-fail.md) ──────────
+ *
+ * Every mutation is a request applied by the acquisition task (scope_mask.h),
+ * so each command waits for the acknowledgement and SAYS when it did not
+ * arrive, instead of reporting the intent as the result. */
+static bool mask_post_wait(scope_mask_req_t k, uint8_t a, uint8_t b, uint16_t n)
+{
+    uint32_t seq = scope_mask_post(k, a, b, n);
+    for (int i = 0; i < 40; i++) {
+        if (scope_mask_acked(seq)) return true;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    usb_send_str("NOT APPLIED: the acquisition loop did not pick the request up in 400 ms\r\n"
+                 "(not a live-scope build, scope not initialised, or acq parked).\r\n");
+    return false;
+}
+
+static const char *mask_state_str(mask_pf_state_t s)
+{
+    return s == MASK_PF_READY ? "READY" : s == MASK_PF_TEACHING ? "TEACHING" : "EMPTY";
+}
+
+static const char *mask_verdict_str(mask_pf_verdict_t v)
+{
+    return v == MASK_PF_V_PASS ? "PASS" : v == MASK_PF_V_FAIL ? "FAIL" :
+           v == MASK_PF_V_SKIP ? "SKIP" : "-";
+}
+
+static void mask_print_cond_diff(uint8_t d)
+{
+    if (d & MASK_PF_C_RANGE1)     usb_send_str(" CH1-range");
+    if (d & MASK_PF_C_RANGE2)     usb_send_str(" CH2-range");
+    if (d & MASK_PF_C_COUPLING)   usb_send_str(" coupling");
+    if (d & MASK_PF_C_TIMEBASE)   usb_send_str(" timebase");
+    if (d & MASK_PF_C_TRIG_LEVEL) usb_send_str(" trig-level");
+    if (d & MASK_PF_C_TRIG_EDGE)  usb_send_str(" trig-edge");
+    if (d & MASK_PF_C_TRIG_SRC)   usb_send_str(" trig-source");
+}
+
+static void mask_print_status(void)
+{
+    scope_mask_summary_t s;
+    scope_mask_summary(&s);
+    usb_debug_printf("mask %s  chans %s%s  span 320 from anchor-%d  tol v=%u cnt h=%u smp%s\r\n",
+                     mask_state_str(s.state), (s.chans & 1u) ? "CH1" : "",
+                     (s.chans & 2u) ? ((s.chans & 1u) ? "+CH2" : "CH2") : "",
+                     (int)s.pre, (unsigned)s.tol_v, (unsigned)s.tol_h,
+                     s.rail_limited ? "  RAIL-LIMITED" : "");
+    if (s.state == MASK_PF_TEACHING || s.teach_rejects) {
+        usb_debug_printf("teach %u/%u  rejected %lu", (unsigned)s.teach_got,
+                         (unsigned)s.teach_target, (unsigned long)s.teach_rejects);
+        if (s.teach_last_reject != MASK_PF_R_OK)
+            usb_debug_printf(" (last: %s)", mask_pf_reason_str(s.teach_last_reject));
+        usb_send_str("\r\n");
+    }
+    if (s.state == MASK_PF_READY) {
+        usb_debug_printf("taught under: range %u/%u coupling %u/%u tb 0x%02X trig code %u %s src CH%u  spread %u cnt\r\n",
+                         s.cond.range[0], s.cond.range[1], s.cond.coupling[0], s.cond.coupling[1],
+                         s.cond.timebase, s.cond.trig_code, s.cond.trig_edge ? "falling" : "rising",
+                         (unsigned)s.cond.trig_src + 1u, (unsigned)s.spread);
+    }
+    usb_debug_printf("tested %lu  pass %lu  fail %lu  skipped %lu  missed %lu  max-consec-fail %lu\r\n",
+                     (unsigned long)s.tested, (unsigned long)s.passed, (unsigned long)s.failed,
+                     (unsigned long)s.skipped, (unsigned long)s.missed,
+                     (unsigned long)s.max_consec_fail);
+    const mask_pf_t *m = scope_mask_raw();
+    if (s.skipped && m != NULL) {
+        usb_send_str("skips:");
+        for (unsigned r = 1; r < MASK_PF_R_COUNT; r++)
+            if (m->skipped[r]) usb_debug_printf(" %s=%lu", mask_pf_reason_str((mask_pf_reason_t)r),
+                                                (unsigned long)m->skipped[r]);
+        usb_send_str("\r\n");
+    }
+    usb_debug_printf("last %s gen %lu", mask_verdict_str(s.last.verdict), (unsigned long)s.last.gen);
+    if (s.last.verdict == MASK_PF_V_SKIP) {
+        usb_debug_printf(" (%s", mask_pf_reason_str(s.last.reason));
+        if (s.last.reason == MASK_PF_R_SETTINGS) mask_print_cond_diff(s.last.cond_diff);
+        usb_send_str(")");
+    }
+    usb_send_str("\r\n");
+    if (s.failed)
+        usb_debug_printf("last FAIL gen %lu: %u samples out, first CH%d col %d, worst %d cnt\r\n",
+                         (unsigned long)s.last_fail.gen, (unsigned)s.last_fail.violations,
+                         (int)s.last_fail.first_ch + 1, (int)s.last_fail.first_col,
+                         (int)s.last_fail.worst);
+    usb_debug_printf("stop-on-fail %s%s\r\n", s.stop_on_fail ? "ON" : "OFF",
+                     s.hold ? "  -- HOLDING a failed record (mask run / OK to resume)" : "");
+    usb_debug_printf("move-focus %s\r\n", scope_mask_focus ? "mask" : scope_hpos_focus ? "position" :
+                     scope_trig_level_focus ? "trig-level" : "vdiv");
+    usb_debug_printf("heap free %lu (min ever %lu)\r\n", (unsigned long)xPortGetFreeHeapSize(),
+                     (unsigned long)xPortGetMinimumEverFreeHeapSize());
+}
+
+static void cmd_mask(const char *args)
+{
+    while (*args == ' ') args++;
+    if (*args == 0 || strncmp(args, "status", 6) == 0) {
+        mask_print_status();
+        return;
+    }
+    if (strncmp(args, "teach", 5) == 0) {
+        const char *p = args + 5;
+        uint32_t n = 0;
+        uint8_t ch = 0;
+        while (*p) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            if (strncmp(p, "ch1", 3) == 0)       ch = 1;
+            else if (strncmp(p, "ch2", 3) == 0)  ch = 2;
+            else if (strncmp(p, "both", 4) == 0) ch = 3;
+            else if (parse_int(p, &n) != 0 || n == 0 || n > MASK_PF_TEACH_MAX) {
+                usb_debug_printf("usage: mask teach [1..%u] [ch1|ch2|both]\r\n", MASK_PF_TEACH_MAX);
+                return;
+            }
+            while (*p && *p != ' ') p++;
+        }
+        if (!mask_post_wait(SCOPE_MASK_REQ_TEACH, ch, 0, (uint16_t)n)) return;
+        const char *why = scope_mask_teach_refusal();
+        if (why) { usb_debug_printf("teach REFUSED: %s\r\n", why); return; }
+        mask_print_status();
+        return;
+    }
+    if (strncmp(args, "tol", 3) == 0) {
+        const char *p = args + 3;
+        while (*p == ' ') p++;
+        uint32_t v = 0, h = MASK_PF_TOL_H_DEFAULT;
+        if (parse_int(p, &v) != 0 || v > 255u) {
+            usb_debug_printf("usage: mask tol <v counts 0..255> [h samples 0..%u]\r\n", MASK_PF_HMAX);
+            return;
+        }
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+        if (*p && (parse_int(p, &h) != 0 || h > MASK_PF_HMAX)) {
+            usb_debug_printf("usage: mask tol <v counts 0..255> [h samples 0..%u]\r\n", MASK_PF_HMAX);
+            return;
+        }
+        if (mask_post_wait(SCOPE_MASK_REQ_TOL, (uint8_t)v, (uint8_t)h, 0)) mask_print_status();
+        return;
+    }
+    if (strncmp(args, "clear", 5) == 0) {
+        if (mask_post_wait(SCOPE_MASK_REQ_CLEAR, 0, 0, 0)) usb_send_str("mask cleared\r\n");
+        return;
+    }
+    if (strncmp(args, "reset", 5) == 0) {
+        if (mask_post_wait(SCOPE_MASK_REQ_RESET, 0, 0, 0)) mask_print_status();
+        return;
+    }
+    if (strncmp(args, "run", 3) == 0) {
+        if (mask_post_wait(SCOPE_MASK_REQ_RELEASE, 0, 0, 0)) usb_send_str("hold released\r\n");
+        return;
+    }
+    if (strncmp(args, "stop", 4) == 0) {
+        const char *p = args + 4;
+        while (*p == ' ') p++;
+        uint8_t on;
+        if (strncmp(p, "on", 2) == 0)       on = 1;
+        else if (strncmp(p, "off", 3) == 0) on = 0;
+        else { usb_send_str("usage: mask stop on|off\r\n"); return; }
+        if (mask_post_wait(SCOPE_MASK_REQ_STOPFAIL, on, 0, 0)) mask_print_status();
+        return;
+    }
+    if (strncmp(args, "dump", 4) == 0) {
+        /* One line per column: col lo hi [lo2 hi2] [*] -- * = outside in the
+         * last FAIL. Machine-readable for bench scripts. */
+        const mask_pf_t *m = scope_mask_raw();
+        if (m == NULL || m->state != MASK_PF_READY) { usb_send_str("no finished mask\r\n"); return; }
+        usb_debug_printf("mask dump pre %d chans %u\r\n", (int)m->pre, (unsigned)m->chans);
+        for (unsigned i = 0; i < MASK_PF_SPAN; i++) {
+            uint8_t l1 = 0, h1 = 0, l2 = 0, h2 = 0;
+            (void)mask_pf_bounds(m, 0, (uint16_t)i, &l1, &h1);   /* 0 0 = not in mask */
+            (void)mask_pf_bounds(m, 1, (uint16_t)i, &l2, &h2);
+            usb_debug_printf("%u %u %u %u %u%s%s\r\n", i, l1, h1, l2, h2,
+                             mask_pf_fail_col(m, 0, (uint16_t)i) ? " *1" : "",
+                             mask_pf_fail_col(m, 1, (uint16_t)i) ? " *2" : "");
+        }
+        usb_send_str("end\r\n");
+        return;
+    }
+    usb_send_str("usage: mask [status|teach [n] [ch1|ch2|both]|tol <v> [h]|clear|reset|run|stop on|off|dump]\r\n");
+}
+
 typedef struct {
     const char *name;                    /* full command word(s) */
     void (*fn_args)(const char *args);   /* exactly one of these two is set */
@@ -6478,6 +7837,15 @@ static const shell_cmd_t shell_cmds[] = {
           "version                         Firmware info\r\n"),
     CMD_V("status", cmd_status, SC_EXACT,
           "status                          FPGA & system status\r\n"),
+    CMD_A("fwload", cmd_fwload, SC_NEEDARGS,
+          "fwload <size> <crc32hex> [a|b]  Stage an image into W25Q cache slot a/b\r\n"
+          "  then stream exactly <size> raw bytes (scripts/cdc_flash.py does both)\r\n"),
+    CMD_V("fwstat", cmd_fwstat, SC_EXACT,
+          "fwstat                          Staging state / byte count / verdict\r\n"),
+    CMD_V("fwapply", cmd_fwapply, SC_EXACT,
+          "fwapply                         Install the staged image over the app slot\r\n"),
+    CMD_A("fwswap", cmd_fwswap, SC_NEEDARGS,
+          "fwswap a|b                      Install a cached image (no transfer needed)\r\n"),
     CMD_A("usart raw", cmd_usart_raw, SC_NEEDARGS,
           "usart raw <10 hex bytes>       Send raw 10-byte USART frame\r\n" "  e.g.: usart raw 00 00 00 0B 01 00 00 00 00 0B\r\n"),
     CMD_A("usart tx", cmd_usart_tx, SC_NEEDARGS,
@@ -6514,6 +7882,12 @@ static const shell_cmd_t shell_cmds[] = {
           "flash wtest <addr> CONFIRM      Non-destructive write-primitive self-test (blank 4KB sector)\r\n"),
     CMD_V("flash diag", cmd_flash_diag, SC_EXACT,
           "flash diag                      W25Q SR1/SR2/SR3 + WEL-latch check\r\n"),
+    CMD_V("cal status", cmd_cal_status, SC_EXACT,
+          "cal status                      Factory-cal page + W25Q backup state\r\n"),
+    CMD_V("cal backup", cmd_cal_backup, SC_EXACT,
+          "cal backup                      Copy MCU factory-cal page to W25Q (safe)\r\n"),
+    CMD_A("cal restore", cmd_cal_restore, SC_NEEDARGS,
+          "cal restore [force] CONFIRM     Write W25Q backup back to MCU flash 0x08006000\r\n"),
     CMD_A("screen dump", cmd_screen_dump, 0,
           "screen dump [shadow] [x y w h]  Dump text indexed4 LCD shadow\r\n"),
     CMD_A("screen dumpbin", cmd_screen_dumpbin, 0,
@@ -6521,9 +7895,9 @@ static const shell_cmd_t shell_cmds[] = {
     CMD_A("screen shadow", cmd_screen_shadow, 0,
           "screen shadow page [y]          Clear full-screen shadow capture\r\n"),
     CMD_A("fpga cmd", cmd_fpga_cmd, SC_NEEDARGS,
-          "fpga cmd <hi> <lo>              Send FPGA command bytes\r\n" "  e.g.: fpga cmd 0 9   (sends 0x00 0x09)\r\n" "        fpga cmd 0x0509 (sends 0x05 0x09)\r\n"),
+          "fpga cmd <hi> <lo>              Send FPGA command bytes (HEX)\r\n" "  e.g.: fpga cmd 05 14 (sends 0x05 0x14)\r\n" "        fpga cmd 0x0509 (sends 0x05 0x09)\r\n"),
     CMD_A("fpga frame", cmd_fpga_frame, SC_NEEDARGS,
-          "fpga frame <hi> <lo> [p1..p5 [ck]]  Build/send full 10-byte frame\r\n" "  e.g.: fpga frame 00 0B 01 00 00 00 00\r\n"),
+          "fpga frame <hi> <lo> [p1..p5 [ck]]  Build/send full 10-byte frame (HEX)\r\n" "  e.g.: fpga frame 00 0B 01 00 00 00 00\r\n"),
     CMD_V("fpga diag clear", cmd_fpga_diag_clear, SC_EXACT,
           "fpga diag clear                 Clear FPGA bench counters/state\r\n"),
     CMD_V("fpga selftest", cmd_fpga_selftest, SC_EXACT,
@@ -6536,6 +7910,10 @@ static const shell_cmd_t shell_cmds[] = {
 #endif
     CMD_V("fpga busrelease", cmd_fpga_bus_release, SC_EXACT,
           "fpga busrelease                 Hand SPI3 to an external master (one-way, EXPERIMENTAL)\r\n"),
+    CMD_V("fpga busreacquire", cmd_fpga_bus_reacquire, SC_EXACT,
+          "fpga busreacquire               Take SPI3 back after busrelease (H7 capture prep)\r\n"),
+    CMD_V("fpga configbb", cmd_fpga_configbb, SC_EXACT,
+          "fpga configbb                   Run GPIO bit-bang SSPI config on demand (H7 step 1)\r\n"),
     CMD_V("fpga stock diag", cmd_fpga_stock_diag, SC_EXACT,
           "fpga stock diag                Show stock-state bench shadow\r\n"),
     CMD_V("fpga stock clear", cmd_fpga_stock_clear, SC_EXACT,
@@ -6584,8 +7962,49 @@ static const shell_cmd_t shell_cmds[] = {
           "fpga scope measure [reps]       Badge values raw (uV/permille/mHz) for bench validation\r\n"),
     CMD_A("fpga scope freq", cmd_fpga_scope_freq, 0,
           "fpga scope freq [n]             Run the shipped frequency estimator n times, with diagnostics\r\n"),
+    CMD_A("fpga scope graticule", cmd_fpga_scope_graticule, 0,
+          "fpga scope graticule [auto|true|toggle]  Trace at true volts/div vs autofit-to-band\r\n"),
+    CMD_A("fpga scope softtrig", cmd_fpga_scope_softtrig, 0,
+          "fpga scope softtrig [on|off|toggle]      Lock trace to trigger crossing vs free-run\r\n"),
     CMD_V("settings", cmd_settings, SC_EXACT,
           "settings                        Persistence status: bound, load result, writes, failures\r\n"),
+    CMD_A("fpga postedge", cmd_fpga_postedge, 0,
+          "fpga postedge [ms]              Poll start after a handover, ms (EXP-54; derived fill + 100)\r\n"),
+    CMD_A("fpga scope hpos", cmd_fpga_scope_hpos, 0,
+          "fpga scope hpos [8..312]        Screen column of the trigger point (default 160)\r\n"),
+    CMD_A("fpga scope coupling", cmd_fpga_scope_coupling, 0,
+          "fpga scope coupling             Coupling label vs PD12/PD13 relay pins (read-only)\r\n"),
+    CMD_A("fpga scope edge", cmd_fpga_scope_edge, 0,
+          "fpga scope edge [rising|falling] Trigger edge (display soft trigger + MCU edge filter)\r\n"),
+    CMD_A("btn", cmd_btn, SC_NEEDARGS,
+          "btn <name> [n]                  Inject a button press (not power) into the UI\r\n"),
+    CMD_A("mask", cmd_mask, 0,
+          "mask [status]                   Waveform pass/fail: state, counts, last verdict\r\n"
+          "mask teach [n] [ch1|ch2|both]   Teach from the next n good records (default 8)\r\n"
+          "mask tol <v> [h]                Tolerance: v ADC counts, h samples 0..16 (default 8 2)\r\n"
+          "mask clear|reset|run            Drop mask | zero counts | release a fail hold\r\n"
+          "mask stop on|off                Hold the acquisition on a failed record\r\n"
+          "mask dump                       Bounds per column (bench scripts)\r\n"),
+    CMD_A("fpga edgefilter", cmd_fpga_edgefilter, 0,
+          "fpga edgefilter [on|off]        MCU trigger edge filter: keep Rising/Falling records (default on)\r\n"),
+    CMD_A("fpga pollgap", cmd_fpga_pollgap, 0,
+          "fpga pollgap [ms]               Poll cadence after the poll start (EXP-54; default 30)\r\n"),
+    CMD_A("fpga autolive", cmd_fpga_autolive, 0,
+          "fpga autolive [on|off]          AUTO: show every untriggered read (EXP-72)\r\n"),
+    CMD_A("fpga holdlog", cmd_fpga_holdlog, 0,
+          "fpga holdlog [on|off]           Per-handover interval log (EXP-72); no arg = dump\r\n"),
+    CMD_A("fpga holdread", cmd_fpga_holdread, 0,
+          "fpga holdread                   Retired (EXP-54)\r\n"),
+    CMD_A("fpga unrotate", cmd_fpga_unrotate, 0,
+          "fpga unrotate [on|off]          Time-order strobed records at the seam; trigger at 512 (default on)\r\n"),
+    CMD_A("fpga acqbr", cmd_fpga_acqbr, 0,
+          "fpga acqbr [0-7|off]            SPI3 clock the acq task sets before each pair (EXP-46)\r\n"),
+    CMD_A("fpga pairgap", cmd_fpga_pairgap, 0,
+          "fpga pairgap [ms]               Gap between the 04 and 05 reads (EXP-45)\r\n"),
+    CMD_A("fpga scope trigmode", cmd_fpga_scope_trigmode, 0,
+          "fpga scope trigmode [auto|normal|single]  Acq wait policy (EXP-43)\r\n"),
+    CMD_A("fpga scope level", cmd_fpga_scope_level, 0,
+          "fpga scope level [-100..100]    Digital trigger level -> reg 0x08 code (EXP-41)\r\n"),
     CMD_A("fpga scope timebase", cmd_fpga_scope_timebase, 0,
           "fpga scope timebase [code]      Set timebase in BOTH display state and reg 0x01 (hex)\r\n"),
     CMD_A("fpga scope center", cmd_fpga_scope_center, 0,
@@ -6594,6 +8013,14 @@ static const shell_cmd_t shell_cmds[] = {
           "fpga usart [on|off]             Bring USART2 up post-config; show CTRL1+RX\r\n"),
     CMD_A("fpga rearm", cmd_fpga_rearm, 0,
           "fpga rearm [on|off]             Stock post-read re-arm (reg01) A/B toggle\r\n"),
+    CMD_A("meter hdr", cmd_meter_hdr, 0,
+          "meter hdr [on|off]              Meter TX header AA 55 (default) vs 00 00 (EXP-25) + echo ladder\r\n"),
+    CMD_A("fpga autowait", cmd_fpga_autowait, 0,
+          "fpga autowait [ms]              AUTO edge-wait budget before fallback read (EXP-42)\r\n"),
+    CMD_A("fpga rearmwait", cmd_fpga_rearmwait, 0,
+          "fpga rearmwait [ms]             Settle after re-arm before next read (EXP-40)\r\n"),
+    CMD_A("fpga acqgate", cmd_fpga_acqgate, 0,
+          "fpga acqgate [on|off]           Stock PRE-read data-ready gate (EXP-29) A/B toggle\r\n"),
     CMD_A("fpga rate", cmd_fpga_rate, 0,
           "fpga rate [hexidx]              reg-0x01 rate index the re-arm rewrites\r\n"),
     CMD_V("fpga scope reinit", cmd_fpga_scope_reinit, SC_EXACT,
@@ -6613,7 +8040,7 @@ static const shell_cmd_t shell_cmds[] = {
     CMD_A("fpga scope trig", cmd_fpga_scope_trig, SC_NEEDARGS,
           "fpga scope trig <4 bytes>       Send 0x07/0x0A,0x16..0x19\r\n"),
     CMD_A("mode", cmd_mode, 0,
-          "mode meter [submode] [layout]   Switch UI + FPGA to DMM frontend\r\n" "mode scope                      Switch UI + FPGA to scope frontend\r\n" "mode startup [scope|meter]      Get/set Settings > Startup on Boot\r\n"),
+          "mode meter [submode] [layout]   Switch UI + FPGA to DMM frontend ('mode 1' = same)\r\n" "mode scope                      Switch UI + FPGA to scope frontend ('mode 0' = same)\r\n" "mode startup [scope|meter]      Get/set Settings > Startup on Boot\r\n"),
     CMD_A("meter dump", cmd_meter_dump, 0,
           "meter dump [delay_ms]           Show parsed DMM/UI/raw frame state\r\n"),
     CMD_A("meter autoscan", cmd_meter_autoscan, 0,
@@ -6652,6 +8079,8 @@ static const shell_cmd_t shell_cmds[] = {
           "spi3 seq <b..> | <b..>          xfer w/ mid-sequence CS pulse at '|'\r\n"),
     CMD_A("spi3 read", cmd_spi3_read, 0,
           "spi3 read [len]                 Raw SPI3 read + hex dump\r\n"),
+    CMD_V("spi3 frame", cmd_spi3_frame, SC_EXACT,
+          "spi3 frame                      Coherent CH1+CH2 snapshot + gen + render trig offset\r\n"),
     CMD_V("reboot bootloader", cmd_reboot_bootloader, SC_EXACT,
           "reboot bootloader               Reboot into USB HID updater\r\n"),
     CMD_V("spi3 acqread", cmd_spi3_acqread, SC_EXACT | SC_SPI3,
@@ -6664,6 +8093,8 @@ static const shell_cmd_t shell_cmds[] = {
           "spi3 armtest [pb11|pc6]         Pulse FPGA run/re-arm pin, re-cfg, acqread\r\n"),
     CMD_V("spi3 gowin", cmd_spi3_gowin, SC_EXACT | SC_SPI3,
           "spi3 gowin                      Read+decode Gowin ID/USERCODE/STATUS regs\r\n"),
+    CMD_A("spi3 edgecap", cmd_spi3_edgecap, SC_SPI3,
+          "spi3 edgecap [reps]             EXP-37: AF vs bit-bang 0x15 frames for LA edge-diff\r\n"),
     CMD_A("spi3 scopetest", cmd_spi3_scopetest, SC_SPI3,
           "spi3 scopetest [bank]           Full scope seq: USART cfg->PC0->0x04/05 read\r\n"),
     CMD_V("spi3 acqtest", cmd_spi3_acqtest, SC_EXACT | SC_SPI3,
@@ -6811,6 +8242,24 @@ static void vUsbDebugTask(void *pvParameters)
     bool usb_banner_sent = false;
     bool rtt_banner_sent = false;
     uint32_t usb_settle = 0;
+    /* When a transfer dies mid-stream the host still has bytes in flight, and
+     * without this they land in shell_feed() and are parsed as command lines —
+     * a binary typed at the prompt. cdc_flash.py stops at the first chunk
+     * carrying ERROR, so the tail is short, but any other host makes it long.
+     * Swallow exactly what the aborted image still owed, and give up on the
+     * wait after the same silence the loader itself uses, so a host that never
+     * sends the rest cannot leave the shell deaf to the operator. */
+    uint32_t fwl_discard = 0;
+    uint32_t fwl_discard_idle = 0;
+
+    /* The firmware loader borrows this task's bus scratch (the arena `spi3
+     * read` / `spi3 frame` already share, 545a9d8) instead of owning a 512 B
+     * buffer of its own — the RAM ceiling is that close. Safe for the same
+     * reason theirs is: every fw_loader entry point runs on this task, and no
+     * other command can interleave with a transfer (RX is routed to the
+     * loader) or an install (interrupts are off). */
+    fw_loader_attach_scratch(shell_bus_scratch, sizeof(shell_bus_scratch));
+    fw_loader_breadcrumb_capture();   /* last install's record, read once and cleared */
 
     for (;;) {
         bool did_work = false;
@@ -6870,7 +8319,52 @@ static void vUsbDebugTask(void *pvParameters)
             } else {
                 uint16_t rx_len = usb_vcp_get_rxdata(&usb_core_dev, rx_buf);
                 if (rx_len > 0) {
-                    shell_feed(rx_buf, rx_len, true);
+                    if (fw_loader_active()) {
+                        /* Raw image bytes for fw_loader — no echo, no line
+                         * editor. Progress every 64 KB so a long transfer
+                         * is visibly alive without flooding the port. */
+                        uint32_t before = fw_loader_bytes();
+                        fw_loader_feed(rx_buf, rx_len);
+                        if ((fw_loader_bytes() >> 16) != (before >> 16)) {
+                            char pbuf[24];
+                            snprintf(pbuf, sizeof(pbuf), "..%luK\r\n",
+                                     (unsigned long)(fw_loader_bytes() >> 10));
+                            usb_send_str(pbuf);
+                        }
+                        if (!fw_loader_active()) {
+                            fwl_print_status();  /* staged or failed — say so */
+                            if (fw_loader_state() == FW_LOADER_ERROR) {
+                                /* The host has sent `before + rx_len` bytes
+                                 * so far — the tail of THIS packet is already
+                                 * off the wire even when the loader refused
+                                 * it, so `expected - bytes()` would over-
+                                 * count and the drain would eat up to a
+                                 * packet of the operator's next keystrokes.
+                                 * Count what is still in flight instead. */
+                                uint32_t sent = before + rx_len;
+                                fwl_discard =
+                                    sent < fw_loader_expected()
+                                        ? fw_loader_expected() - sent
+                                        : 0;
+                                fwl_discard_idle = 0;
+                            }
+                        }
+                    } else if (fwl_discard > 0) {
+                        uint32_t drop = rx_len < fwl_discard ? rx_len
+                                                             : fwl_discard;
+                        fwl_discard -= drop;
+                        fwl_discard_idle = 0;
+                        if (fwl_discard == 0) {
+                            usb_send_str("fwload: aborted image drained; "
+                                         "shell is listening again\r\n");
+                        }
+                        if (rx_len > drop) {
+                            shell_feed(rx_buf + drop,
+                                       (uint16_t)(rx_len - drop), true);
+                        }
+                    } else {
+                        shell_feed(rx_buf, rx_len, true);
+                    }
                     did_work = true;
                 }
             }
@@ -6881,6 +8375,38 @@ static void vUsbDebugTask(void *pvParameters)
 #else
         (void)rx_buf; (void)usb_banner_sent; (void)usb_settle;
 #endif
+
+        /* Age the fw_loader RX-silence timeout, and report if it fires —
+         * the poll is what turns a wedged transfer back into a live shell. */
+        {
+            bool was_loading = fw_loader_active();
+            fw_loader_poll();
+            if (was_loading && !fw_loader_active()) {
+                fwl_print_status();
+                /* A timeout kills the transfer too, and a host that merely
+                 * stalled (>3 s of silence mid-image) may well resume: arm
+                 * the same drain the feed-path error arms, or the rest of
+                 * the image lands in shell_feed() as command lines. No
+                 * packet is in flight here, so expected - received is the
+                 * exact figure. A host that is truly gone costs one more
+                 * 3 s drain expiry, which reports itself. */
+                if (fw_loader_state() == FW_LOADER_ERROR) {
+                    fwl_discard = fw_loader_expected() - fw_loader_bytes();
+                    fwl_discard_idle = 0;
+                }
+            }
+        }
+
+        /* The drain waits on the same 3 s of silence the loader does: a host
+         * that aborted and walked away must not cost the operator a shell. */
+        if (fwl_discard > 0 && !did_work) {
+            if (++fwl_discard_idle >= FW_LOADER_TIMEOUT_POLLS) {
+                fwl_discard = 0;
+                fwl_discard_idle = 0;
+                usb_send_str("fwload: stopped waiting for the aborted image; "
+                             "shell is listening again\r\n");
+            }
+        }
 
         if (!did_work) {
             vTaskDelay(pdMS_TO_TICKS(10));
