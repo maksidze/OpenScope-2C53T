@@ -16,6 +16,8 @@
 #include "math_channel.h"
 #include "component_test.h"
 #include "shared_mem.h"
+#include "esp_activity.h"
+#include "esp_link.h"
 #include <stdio.h>
 
 /* Top-level menu items */
@@ -32,6 +34,7 @@ static const char *settings_items[SETTINGS_ITEM_COUNT] = {
     "FPGA SPI Scanner",
     "Firmware Update",
     "Factory Reset",
+    "ESP32 Apps",
 };
 
 /* Math / Persistence sub-menu items */
@@ -143,6 +146,12 @@ static void draw_settings_top(void)
         if (i == 7) value = startup_mode_name(startup_mode);
         if (i == 8) value = ">";        /* About: has detail screen */
         if (i == 10) value = "DFU";     /* Firmware Update: reboot to bootloader */
+        if (i == 12) {
+            const esp_link_stats_t *st = esp_link_stats();
+            value = esp_link_available() ? ">" :
+                    (!esp_link_started() ?
+                     (st->heap_failures ? "No heap" : "Disabled") : "Waiting");
+        }
 
         draw_menu_item(i, scroll, settings_selected, settings_items[i], value, th);
     }
@@ -249,6 +258,11 @@ void draw_settings_screen(void)
     case 4:  draw_component_test_screen();     break;
     case 5:  draw_resistor_calc_screen();      break;
     case 6:  draw_bode_screen();              break;
+    case 7:
+        /* LVGL runs once from vDisplayTask's top-level service point, never
+         * nested under this native settings renderer/LCD transaction. */
+        if (!esp_activity_active()) esp_activity_draw_launcher();
+        break;
     default: draw_settings_top();              break;
     }
 }

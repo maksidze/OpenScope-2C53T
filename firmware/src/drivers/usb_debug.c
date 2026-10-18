@@ -21,6 +21,8 @@
 #include "cal_backup.h"
 #include "rtt.h"
 #include "continuity_buzzer.h"
+#include "watchdog.h"
+#include "task_stack_budget.h"
 
 /* On the bench unit USB CDC never enumerates (error -71, unsolved), yet
  * usbd_connect_state_get() still reports CONFIGURED — so usb_send_bytes()
@@ -624,6 +626,22 @@ static void cmd_version(void)
 static void cmd_status(void)
 {
     extern volatile uint32_t uptime_seconds;
+
+    /* FreeRTOS reports untouched stack in words. Query current low-water
+     * marks here, including LVGL's deepest redraw since boot, and print bytes
+     * explicitly so they cannot be confused with the xTaskCreate depth. */
+    usb_debug_printf("RTOS heap free: %lu B, minimum: %lu B\r\n",
+                     (unsigned long)xPortGetFreeHeapSize(),
+                     (unsigned long)xPortGetMinimumEverFreeHeapSize());
+    const task_health_t *tasks = health_get_tasks();
+    for (int i=0;i<health_get_count();i++) {
+        if (!tasks[i].registered || !tasks[i].handle) continue;
+        usb_debug_printf("Task %s stack minimum free: %lu B\r\n",
+                         tasks[i].name,
+                         (unsigned long)(uxTaskGetStackHighWaterMark(tasks[i].handle)*sizeof(StackType_t)));
+    }
+    usb_debug_printf("Display stack allocated: %lu B\r\n",
+                     (unsigned long)(DISPLAY_TASK_STACK_WORDS*sizeof(StackType_t)));
 
     /*
      * Keep the status header in chunks smaller than usb_debug_printf()'s

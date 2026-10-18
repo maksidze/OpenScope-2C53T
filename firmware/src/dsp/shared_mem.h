@@ -38,6 +38,7 @@ typedef enum {
     SHMEM_OWNER_COMPONENT,
     SHMEM_OWNER_BODE,
     SHMEM_OWNER_MODULE,      /* External loaded module */
+    SHMEM_OWNER_ESP_ACTIVITY,/* LVGL heap + partial RGB565 draw buffer */
     SHMEM_OWNER_DISPLAY,
     SHMEM_OWNER_COUNT
 } shmem_owner_t;
@@ -76,6 +77,7 @@ typedef enum {
 #define SHMEM_NEED_COMPONENT    8192    /* 8 KB */
 #define SHMEM_NEED_BODE         4096    /* 4 KB */
 #define SHMEM_NEED_DISPLAY      44400   /* Meter waveform panel: 300 * 74 * RGB565 */
+#define SHMEM_NEED_ESP_ACTIVITY SHMEM_POOL_SIZE /* lifecycle arena, no extra .bss */
 
 /* ── FFT sub-tenants ────────────────────────────────────────────────
  *

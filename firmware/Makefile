@@ -37,7 +37,34 @@ FREERTOS   = FreeRTOS
 ######################################################################
 
 # Feature flags (FFT enabled by default)
-FEATURES ?= FFT
+FEATURES ?= FFT ESP_LINK_BRIDGE
+ifneq ($(findstring ESP_LINK_BRIDGE,$(FEATURES)),)
+  BRIDGE_DEFS := -DESP_LINK_BRIDGE
+endif
+
+# ESP32-Link Activity UI. LVGL is a local cloned dependency like FreeRTOS and
+# the AT32 library; it is never vendored into this repository. Enable with
+# `make FEATURES="FFT ESP_LINK_LVGL"` after cloning the exact v9.5.0 tag.
+LVGL_DIR := lvgl
+ifneq ($(findstring ESP_LINK_LVGL,$(FEATURES)),)
+  ifeq ($(wildcard $(LVGL_DIR)/lvgl.h),)
+    $(error ESP_LINK_LVGL requires firmware/lvgl at tag v9.5.0 commit 85aa60d)
+  endif
+  LVGL_DEFS := -DESP_LINK_LVGL -DLV_CONF_INCLUDE_SIMPLE
+  LVGL_INCLUDES := -I$(LVGL_DIR)
+  ifeq ($(OS),Windows_NT)
+    LVGL_C_SOURCES := $(shell powershell.exe -NoProfile -Command "((Get-ChildItem -Path '$(LVGL_DIR)/src' -Recurse -Filter '*.c' | Where-Object { $$_.FullName -notmatch '[\\/](drivers|debugging|libs)[\\/]' -and $$_.FullName -notmatch '[\\/]draw[\\/](dma2d|eve|espressif|nema_gfx|nxp|renesas|sdl|vg_lite)[\\/]' -and $$_.FullName -notmatch '[\\/]draw[\\/]convert[\\/](helium|neon)[\\/]' }).FullName -replace '\\','/') -join ' '")
+  else
+    LVGL_C_SOURCES := $(shell find $(LVGL_DIR)/src -type f -name '*.c' \
+      ! -path '*/drivers/*' ! -path '*/debugging/*' ! -path '*/libs/*' \
+      ! -path '*/draw/dma2d/*' ! -path '*/draw/eve/*' \
+      ! -path '*/draw/espressif/*' ! -path '*/draw/nema_gfx/*' \
+      ! -path '*/draw/nxp/*' ! -path '*/draw/renesas/*' \
+      ! -path '*/draw/sdl/*' ! -path '*/draw/vg_lite/*' \
+      ! -path '*/draw/convert/helium/*' ! -path '*/draw/convert/neon/*')
+endif
+LVGL_C_SOURCES += $(LVGL_DIR)/src/libs/bin_decoder/lv_bin_decoder.c
+endif
 
 # Application
 C_SOURCES  = src/main.c
@@ -64,6 +91,9 @@ C_SOURCES += src/drivers/flash_fs.c
 C_SOURCES += src/drivers/flash_regions.c
 C_SOURCES += src/drivers/flash_regions_w25q.c
 C_SOURCES += src/drivers/esp_comm.c
+C_SOURCES += src/drivers/esp_link_protocol.c
+C_SOURCES += src/drivers/esp_link.c
+C_SOURCES += src/drivers/esp_activity.c
 C_SOURCES += src/drivers/watchdog.c
 C_SOURCES += src/drivers/button_scan.c
 C_SOURCES += src/drivers/continuity_buzzer.c
@@ -116,6 +146,7 @@ C_SOURCES += src/fonts/font_large.c
 C_SOURCES += src/fonts/font_xlarge.c
 C_SOURCES += src/fonts/font_huge.c
 C_SOURCES += src/fonts/font_unit.c
+C_SOURCES += $(LVGL_C_SOURCES)
 
 # FFT / DSP module
 ifneq ($(findstring FFT,$(FEATURES)),)
@@ -156,6 +187,7 @@ C_SOURCES += $(AT32_DRV)/src/at32f403a_407_adc.c
 C_SOURCES += $(AT32_DRV)/src/at32f403a_407_dac.c
 C_SOURCES += $(AT32_DRV)/src/at32f403a_407_tmr.c
 C_SOURCES += $(AT32_DRV)/src/at32f403a_407_usb.c
+C_SOURCES += $(AT32_DRV)/src/at32f403a_407_usart.c
 C_SOURCES += $(AT32_DRV)/src/at32f403a_407_acc.c
 
 # USB Device Middleware (CDC virtual COM port)
@@ -203,6 +235,7 @@ C_INCLUDES += -I$(FREERTOS)/include
 C_INCLUDES += -I$(FREERTOS)/portable/GCC/ARM_CM4F
 C_INCLUDES += -I$(AT32_USBD)/inc
 C_INCLUDES += -I$(AT32_CDC)
+C_INCLUDES += $(LVGL_INCLUDES)
 
 ######################################################################
 # Compiler flags
@@ -216,6 +249,8 @@ MCU = $(CPU) -mthumb $(FPU) $(FLOAT-ABI)
 
 # C defines
 C_DEFS  = -DAT32F403AVGT7
+C_DEFS += $(LVGL_DEFS)
+C_DEFS += $(BRIDGE_DEFS)
 # SCOPE_DEBUG_OVERLAY paints a 4-line debug strip over the bottom of the scope
 # area (rows 180-219). Useful for bench diagnostics, but it sits on top of the
 # trace — disabled for a clean display. Re-add `-DSCOPE_DEBUG_OVERLAY` to bring
@@ -229,6 +264,9 @@ CFLAGS += -Wall -Wextra -Wno-unused-parameter
 CFLAGS += -fdata-sections -ffunction-sections
 CFLAGS += -std=gnu11
 CFLAGS += -Os -g
+# Emit per-function stack frames for the AT32/LVGL stack-budget audit. This
+# changes build diagnostics only; it adds no code or data to the image.
+CFLAGS += -fstack-usage
 
 # Assembler flags
 ASFLAGS = $(MCU) $(C_DEFS) $(C_INCLUDES)
@@ -726,6 +764,16 @@ test-mask-pf: $(BUILD_DIR)/test_mask_pf
 	$<
 
 .PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter
+$(BUILD_DIR)/test_esp_link_protocol: tests/test_esp_link_protocol.c \
+                                      src/drivers/esp_link_protocol.c \
+                                      src/drivers/esp_link_protocol.h | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Isrc/drivers $< \
+		src/drivers/esp_link_protocol.c -o $@
+
+test-esp-link: $(BUILD_DIR)/test_esp_link_protocol
+	$<
+
+.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-esp-link test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk fpga-alt-header
 
 # ═══════════════════════════════════════════════════════════════════════════
 # BENCH / EXPERIMENT IMAGE INDEX                          (index added 2026-08-13)

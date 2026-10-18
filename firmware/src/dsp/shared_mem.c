@@ -23,6 +23,7 @@ static const char *owner_names[SHMEM_OWNER_COUNT] = {
     "Component",
     "Bode",
     "Module",
+    "ESP Activity",
     "Display",
 };
 
@@ -36,6 +37,7 @@ static const uint32_t owner_needs[SHMEM_OWNER_COUNT] = {
     SHMEM_NEED_COMPONENT,
     SHMEM_NEED_BODE,
     0, /* Module — variable, not known at compile time */
+    SHMEM_NEED_ESP_ACTIVITY,
     SHMEM_NEED_DISPLAY,
 };
 

@@ -46,6 +46,7 @@ uint8_t font_draw_char(uint16_t x, uint16_t y, char c,
         }
     } else {
         /* Opaque mode: use window write for speed */
+        lcd_transaction_begin();
         lcd_set_window(x, y, glyph_w, font->height);
         for (uint8_t row = 0; row < font->height; row++) {
             const uint8_t *row_data = &glyph_data[row * bytes_per_row];
@@ -57,6 +58,7 @@ uint8_t font_draw_char(uint16_t x, uint16_t y, char c,
                 }
             }
         }
+        lcd_transaction_end();
     }
 
     return advance;

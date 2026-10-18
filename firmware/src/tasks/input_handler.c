@@ -35,12 +35,57 @@
 #include "at32f403a_407.h"
 #include "button_scan.h"
 #include "settings_store.h"
+#include "esp_activity.h"
+#include "esp_link.h"
 #include "task.h"
 #include <stdio.h>
 #include <string.h>
 
 /* MENU is bit 9 in the raw button-scan state (button_scan.c). */
 #define BTN_SCAN_MENU_MASK  0x0200u
+
+static volatile uint8_t remote_mode = 0xFFu;
+
+bool input_request_mode(device_mode_t mode)
+{
+    if ((unsigned)mode >= MODE_COUNT || ui_modal_active) return false;
+    taskENTER_CRITICAL();
+    bool accepted = remote_mode == 0xFFu || remote_mode == (uint8_t)mode;
+    if (accepted) remote_mode = (uint8_t)mode;
+    taskEXIT_CRITICAL();
+    return accepted;
+}
+
+static void change_mode(device_mode_t mode)
+{
+    meter_autoselect_cancel();
+    if (esp_activity_active()) {
+        esp_link_request_app_stop(0);
+    }
+    current_mode = mode;
+    settings_depth = 0;
+    settings_sub_selected = 0;
+    if (mode == MODE_SETTINGS) settings_selected = 0;
+    /* Same hardware entry points as physical MENU: the remote path must not
+     * merely change the screen while leaving the meter MUX/acquisition active. */
+    if (mode == MODE_MULTIMETER) fpga_request_meter_mode(meter_submode);
+    else if (mode == MODE_SIGNAL_GEN) fpga_enter_siggen_mode();
+    else if (mode == MODE_OSCILLOSCOPE) fpga_enter_scope_mode();
+    else GPIOC->clr = (1U << 11); /* PC11: meter MUX disable, stock mode boundary. */
+}
+
+void input_service_remote_mode(QueueHandle_t dq)
+{
+    taskENTER_CRITICAL();
+    uint8_t mode = remote_mode;
+    remote_mode = 0xFFu;
+    taskEXIT_CRITICAL();
+    if (mode >= MODE_COUNT || ui_modal_active) return;
+    if (current_mode != (device_mode_t)mode) change_mode((device_mode_t)mode);
+    uint8_t cmd = DCMD_REDRAW_ALL;
+    (void)xQueueSend(dq, &cmd, 0);
+    /* Remote browsing is transient; unlike physical MENU it does not wear NVS. */
+}
 
 /* ── Settings persistence hooks ──────────────────────────────────────
  * The input task is the only thing that changes settings, so it is also what
@@ -143,6 +188,10 @@ void input_handle_settings_ok(void)
                 (void)settings_store_flush(settings_now_ms());
                 dfu_request_reboot();
             }
+            break;
+        case 12: /* ESP32 Apps -- native launcher, LVGL-rendered Activities */
+            settings_depth = 7;
+            esp_link_request_app_list();
             break;
         default:
             break;
@@ -371,6 +420,22 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
             return cmd;
         }
     }
+    /* ESP Activity keys are events, not native-mode mutations. POWER stays
+     * host-reserved and falls through to the authoritative shutdown path.
+     * The launcher itself is native/trusted so MENU can always leave it. */
+    if (current_mode == MODE_SETTINGS && settings_depth == 7 &&
+        button != BTN_POWER) {
+        if (esp_activity_active()) {
+            esp_activity_input_key((uint8_t)button);
+            return DCMD_DRAW_SETTINGS;
+        }
+        if (button == BTN_UP) esp_activity_launcher_move(-1);
+        else if (button == BTN_DOWN) esp_activity_launcher_move(1);
+        else if (button == BTN_OK) esp_activity_launcher_start_selected();
+        else if (button == BTN_MENU) { settings_depth = 0; settings_sub_selected = 0; }
+        send_cmd(dq, DCMD_DRAW_SETTINGS);
+        return DCMD_DRAW_SETTINGS;
+    }
 
     switch (button) {
 
@@ -382,22 +447,7 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
             settings_depth = 0;
             settings_sub_selected = 0;
         } else {
-            current_mode = (device_mode_t)((current_mode + 1) % MODE_COUNT);
-            if (current_mode == MODE_SETTINGS) {
-                settings_selected = 0;
-                settings_depth = 0;
-            }
-            /* Tell the FPGA which mode we're entering.
-             * Each mode needs different FPGA commands and analog MUX config. */
-            if (current_mode == MODE_MULTIMETER) {
-                fpga_request_meter_mode(meter_submode);   /* background: no frozen buttons */
-            } else if (current_mode == MODE_SIGNAL_GEN) {
-                fpga_enter_siggen_mode();
-            } else if (current_mode == MODE_OSCILLOSCOPE) {
-                fpga_enter_scope_mode();
-            } else {
-                GPIOC->clr = (1U << 11);  /* PC11 LOW — meter disable */
-            }
+            change_mode((device_mode_t)((current_mode + 1) % MODE_COUNT));
         }
         /* Leaving a mode, or backing out of the settings menu, is a deliberate
          * boundary: commit now rather than waiting out the settle window. */
@@ -1054,6 +1104,11 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
 
     case BTN_POWER:
         {
+            /* Remote cleanup is best effort; local teardown is immediate and
+             * cannot veto or delay the unchanged three-second power policy. */
+            if (current_mode == MODE_SETTINGS && settings_depth == 7 &&
+                esp_activity_active())
+                esp_link_request_app_stop(1);
             const theme_t *th = theme_get();
             uint16_t bg = 0x0010;  /* dark background */
 
@@ -1087,11 +1142,13 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
              * frame that slipped past the modal claim heals within 1 s. */
             for (int countdown = 3; countdown > 0; countdown--) {
                 char digit[2] = { '0' + countdown, '\0' };
+                lcd_transaction_begin();
                 lcd_fill_rect(60, 80, 200, 80, bg);
                 font_draw_string_center(160, 88, "Hold to power off",
                                         th->warning, bg, &font_medium);
                 font_draw_string_center(160, 115, digit,
                                         th->text_primary, bg, &font_large);
+                lcd_transaction_end();
 
                 /* Wait 1 second, polling button every 50ms */
                 for (int i = 0; i < 20; i++) {
@@ -1107,9 +1164,11 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
             }
 
             /* Still held after 3 seconds — power off */
+            lcd_transaction_begin();
             lcd_fill_rect(60, 80, 200, 80, bg);
             font_draw_string_center(160, 110, "Goodbye!",
                                     th->success, bg, &font_large);
+            lcd_transaction_end();
             vTaskDelay(pdMS_TO_TICKS(500));
 
             /* Last chance to persist: an orderly power-off is the one place we

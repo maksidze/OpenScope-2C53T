@@ -16,6 +16,7 @@
 #ifndef LCD_H
 #define LCD_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* ========================================================================
@@ -163,6 +164,21 @@
 /* Low-level initialization */
 void lcd_gpio_init(void);       /* Configure EXMC GPIO pins (PD, PE) */
 void lcd_fsmc_init(void);       /* Configure EXMC/FSMC bus timing    */
+
+/* PE0/PE1 are shared by UART8 and the XMC LB/UB signals. Once the ESP link
+ * is initialized, enable arbitration so XMC is clocked only while an LCD
+ * transaction owns the bus. Disabling arbitration restores the traditional
+ * always-on XMC state for fail-closed operation without ESP. */
+void lcd_uart_bus_arbitration_enable(void);
+void lcd_uart_bus_arbitration_disable(void);
+bool lcd_uart_bus_tx_allowed(void);
+bool lcd_uart_bus_uart_active(void);
+void lcd_uart_bus_note_rx_activity(void);
+
+/* Keep one ST7789 address-window setup and its following pixel stream under
+ * the same XMC ownership. Calls are recursive for the owning task. */
+void lcd_transaction_begin(void);
+void lcd_transaction_end(void);
 
 /* LCD register access (memory-mapped via EXMC) */
 void lcd_write_cmd(uint8_t cmd);

@@ -16,8 +16,17 @@
  */
 
 #include "lcd.h"
+#include "esp_link.h"
 
 #include <stdbool.h>
+#ifndef EMULATOR_BUILD
+#include "FreeRTOS.h"
+#include "task.h"
+#include "at32f403a_407.h"
+#include "at32f403a_407_crm.h"
+#include "at32f403a_407_gpio.h"
+#include "at32f403a_407_usart.h"
+#endif
 
 /* ========================================================================
  * Embedded 8x16 ASCII font (chars 0x20-0x7E)
@@ -134,6 +143,257 @@ static inline void lcd_bus_delay(void) {
     volatile uint32_t i = 50;
     while (i--) __asm volatile("nop");
 }
+
+#if !defined(EMULATOR_BUILD) && !defined(ESP_LINK_BRIDGE)
+/* AT32F403A V2.04 assigns PE0/PE1 to both UART8 and XMC LB/UB. The LCD's
+ * confirmed 16-bit data path uses neither byte-lane pad, but bench captures
+ * show UART8 is not routed while XMC and UART8 clocks are both enabled. This
+ * arbiter therefore keeps only one peripheral active. Before XMC ownership,
+ * OSLP BUS_QUIESCE makes the ESP ACK and stop transmitting. PE1 is then held
+ * HIGH as GPIO so XMC_UB cannot look like UART start bits at the ESP input.
+ *
+ * The owner/depth pair is static rather than a FreeRTOS mutex because LCD
+ * primitives are recursive and spare heap is constrained. All active
+ * 0x600... accesses are confined to this translation unit. */
+static volatile bool lcd_uart_arbitration;
+static volatile bool lcd_uart_lcd_pending;
+static volatile bool lcd_uart_active = true;
+static volatile bool lcd_emergency_xmc;
+static volatile TaskHandle_t lcd_bus_owner;
+static uint16_t lcd_bus_depth;
+static volatile uint32_t lcd_uart_last_rx_cycle;
+
+static void lcd_pe1_gpio_high(void)
+{
+    gpio_init_type g;
+    gpio_bits_set(GPIOE,GPIO_PINS_1);
+    gpio_default_para_init(&g);
+    g.gpio_pins=GPIO_PINS_1;
+    g.gpio_mode=GPIO_MODE_OUTPUT;
+    g.gpio_out_type=GPIO_OUTPUT_PUSH_PULL;
+    g.gpio_drive_strength=GPIO_DRIVE_STRENGTH_STRONGER;
+    gpio_init(GPIOE,&g);
+}
+
+static void lcd_pe1_uart_mux(void)
+{
+    gpio_init_type g;
+    gpio_default_para_init(&g);
+    g.gpio_pins=GPIO_PINS_1;
+    /* PE1 is the software UART TX because XMC_UB wins the hardware UART8
+     * alternate-function arbitration on the populated V1.4 board. */
+    g.gpio_mode=GPIO_MODE_OUTPUT;
+    g.gpio_out_type=GPIO_OUTPUT_PUSH_PULL;
+    g.gpio_drive_strength=GPIO_DRIVE_STRENGTH_STRONGER;
+    gpio_init(GPIOE,&g);
+}
+
+static void lcd_pe0_uart_input(void)
+{
+    gpio_init_type g;
+    gpio_default_para_init(&g);
+    g.gpio_pins=GPIO_PINS_0;
+    g.gpio_mode=GPIO_MODE_INPUT;
+    g.gpio_pull=GPIO_PULL_UP;
+    gpio_init(GPIOE,&g);
+}
+
+/* These are the hardware-confirmed ST7789/XMC bank-0 values also installed
+ * by lcd_exmc_init().  PE0/PE1 are the XMC LB/UB byte-lane pins as well as
+ * UART8 RX/TX.  Merely clearing NRBKEN did not release PE1 on the V1.4 bench
+ * board: UART8 accepted bytes internally (TDBE IRQs advanced) while the pad
+ * stayed HIGH.  Therefore the UART phase removes the complete bank
+ * configuration, and every LCD phase reconstructs it before the first
+ * 0x600... access.  This is an empirical AT32 mux-priority requirement; the
+ * LCD itself does not use LB/UB because all accesses are 16-bit RGB565. */
+static void lcd_xmc_bank0_configure(void)
+{
+    EXMC_SNCTL0=0x00005010u;
+    EXMC_SNTCFG0=0x02020424u;
+    EXMC_SNWTCFG0=0x00000202u;
+    EXMC_SNCTL0|=1u;
+}
+
+static void lcd_xmc_bank0_deconfigure(void)
+{
+    EXMC_SNCTL0=0u;
+    EXMC_SNTCFG0=0u;
+    EXMC_SNWTCFG0=0u;
+}
+
+static void lcd_gate_to_xmc(void)
+{
+    NVIC_DisableIRQ(UART8_IRQn);
+    NVIC_ClearPendingIRQ(UART8_IRQn);
+    usart_interrupt_enable(UART8,USART_RDBF_INT,FALSE);
+    usart_interrupt_enable(UART8,USART_TDBE_INT,FALSE);
+    if(UART8->sts & (USART_RDBF_FLAG|USART_PERR_FLAG|USART_FERR_FLAG|
+                     USART_NERR_FLAG|USART_ROERR_FLAG)) (void)UART8->dt;
+    usart_enable(UART8,FALSE);
+    lcd_pe1_gpio_high();
+    crm_periph_clock_enable(CRM_UART8_PERIPH_CLOCK,FALSE);
+    crm_periph_clock_enable(CRM_XMC_PERIPH_CLOCK,TRUE);
+    lcd_xmc_bank0_configure();
+    __DSB();
+    lcd_uart_active=false;
+}
+
+static void lcd_gate_to_uart(void)
+{
+    /* Disable the memory bank before its AHB clock. No 0x600... access may
+     * follow until the next lcd_gate_to_xmc() has re-enabled NRBKEN. */
+    __DSB();
+    lcd_xmc_bank0_deconfigure();
+    __DSB();
+    crm_periph_clock_enable(CRM_XMC_PERIPH_CLOCK,FALSE);
+    crm_periph_clock_enable(CRM_UART8_PERIPH_CLOCK,TRUE);
+    gpio_pin_remap_config(UART8_GMUX,FALSE);
+    usart_enable(UART8,TRUE);
+    /* UART drives an idle HIGH internally before the GPIO pad is returned to
+     * alternate-function mode, avoiding a false start bit at the ESP RX. */
+    lcd_pe0_uart_input();
+    lcd_pe1_uart_mux();
+    if(UART8->sts & (USART_RDBF_FLAG|USART_PERR_FLAG|USART_FERR_FLAG|
+                     USART_NERR_FLAG|USART_ROERR_FLAG)) (void)UART8->dt;
+    usart_interrupt_enable(UART8,USART_RDBF_INT,TRUE);
+    lcd_uart_active=true;
+    NVIC_ClearPendingIRQ(UART8_IRQn);
+    NVIC_EnableIRQ(UART8_IRQn);
+    __DSB();
+}
+
+static bool lcd_context_may_block(void)
+{
+    return __get_IPSR()==0u && __get_PRIMASK()==0u && __get_BASEPRI()==0u &&
+           xTaskGetSchedulerState()==taskSCHEDULER_RUNNING;
+}
+
+static void lcd_bus_acquire(void)
+{
+    if (!lcd_uart_arbitration) return;
+
+    /* Fault hooks render with interrupts masked. Waiting for a lower-priority
+     * owner there would deadlock permanently, so the diagnostic path forcibly
+     * takes XMC and intentionally leaves it active until reset/power-off. */
+    if (!lcd_context_may_block()) {
+        if (!lcd_emergency_xmc) {
+            /* A fault may interrupt a normal owner after UART8 is already
+             * clock-gated. Do not touch its registers in that state; XMC and
+             * NRBKEN are already ready for the diagnostic renderer. */
+            if (lcd_uart_active) lcd_gate_to_xmc();
+            lcd_emergency_xmc=true;
+        }
+        return;
+    }
+
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    for (;;) {
+        bool acquired = false;
+        taskENTER_CRITICAL();
+        if (lcd_bus_owner == self) {
+            lcd_bus_depth++;
+            taskEXIT_CRITICAL();
+            return;
+        }
+        if (lcd_bus_owner == NULL) {
+            lcd_bus_owner = self;
+            lcd_uart_lcd_pending = true;
+            acquired = true;
+        }
+        taskEXIT_CRITICAL();
+        if (acquired) break;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    /* A failed/missing peer must never freeze the instrument display. With a
+     * live session the ACK is the strict last ESP frame; on timeout we still
+     * draw, then normal HELLO repetition re-establishes the link. */
+    (void)esp_link_bus_quiesce(50u);
+
+    taskENTER_CRITICAL();
+    lcd_gate_to_xmc();
+    lcd_bus_depth = 1;
+    lcd_uart_lcd_pending = false;
+    taskEXIT_CRITICAL();
+}
+
+static void lcd_bus_release(void)
+{
+    if (!lcd_uart_arbitration || lcd_emergency_xmc) return;
+    bool resume=false;
+    taskENTER_CRITICAL();
+    if (lcd_bus_owner == xTaskGetCurrentTaskHandle() && lcd_bus_depth != 0) {
+        if (--lcd_bus_depth == 0) {
+            lcd_gate_to_uart();
+            resume=true;
+        }
+    }
+    taskEXIT_CRITICAL();
+    if(resume) {
+        /* Keep ownership/pending asserted until RESUME is enqueued, so no
+         * ordinary producer can race ahead of the control frame. */
+        (void)esp_link_bus_resume();
+        taskENTER_CRITICAL();
+        lcd_bus_owner=NULL;
+        lcd_uart_lcd_pending=false;
+        taskEXIT_CRITICAL();
+    }
+}
+
+void lcd_uart_bus_arbitration_enable(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    taskENTER_CRITICAL();
+    lcd_xmc_bank0_deconfigure();
+    __DSB();
+    crm_periph_clock_enable(CRM_XMC_PERIPH_CLOCK, FALSE);
+    lcd_bus_owner = NULL;
+    lcd_bus_depth = 0;
+    lcd_uart_lcd_pending = false;
+    lcd_uart_last_rx_cycle = 0;
+    lcd_uart_active=true;
+    lcd_emergency_xmc=false;
+    lcd_uart_arbitration = true;
+    taskEXIT_CRITICAL();
+}
+
+void lcd_uart_bus_arbitration_disable(void)
+{
+    taskENTER_CRITICAL();
+    lcd_uart_arbitration = false;
+    lcd_uart_lcd_pending = false;
+    lcd_bus_owner = NULL;
+    lcd_bus_depth = 0;
+    lcd_gate_to_xmc();
+    taskEXIT_CRITICAL();
+}
+
+bool lcd_uart_bus_tx_allowed(void)
+{
+    return !lcd_uart_arbitration ||
+           (lcd_uart_active && lcd_bus_owner == NULL && !lcd_uart_lcd_pending);
+}
+
+bool lcd_uart_bus_uart_active(void) { return lcd_uart_active; }
+
+void lcd_uart_bus_note_rx_activity(void)
+{
+    lcd_uart_last_rx_cycle = DWT->CYCCNT;
+}
+#else
+static inline void lcd_bus_acquire(void) {}
+static inline void lcd_bus_release(void) {}
+void lcd_uart_bus_arbitration_enable(void) {}
+void lcd_uart_bus_arbitration_disable(void) {}
+bool lcd_uart_bus_tx_allowed(void) { return true; }
+bool lcd_uart_bus_uart_active(void) { return true; }
+void lcd_uart_bus_note_rx_activity(void) {}
+#endif
+
+void lcd_transaction_begin(void) { lcd_bus_acquire(); }
+void lcd_transaction_end(void) { lcd_bus_release(); }
 
 static uint8_t lcd_shadow[LCD_SHADOW_HEIGHT][LCD_SHADOW_STRIDE];
 static uint16_t lcd_shadow_page;
@@ -253,27 +513,51 @@ uint16_t lcd_shadow_page_y(void)
     return lcd_shadow_page;
 }
 
-void lcd_write_cmd(uint8_t cmd)
+static inline void lcd_write_cmd_raw(uint8_t cmd)
 {
     *LCD_CMD_ADDR = (uint16_t)cmd;
     lcd_bus_delay();
 }
 
-void lcd_write_data(uint16_t data)
+static inline void lcd_write_data_raw(uint16_t data)
 {
     *LCD_DATA_ADDR = data;
     lcd_shadow_write_pixel(data);
 }
 
-void lcd_write_data8(uint8_t data)
+static inline void lcd_write_data8_raw(uint8_t data)
 {
     *LCD_DATA_ADDR = (uint16_t)data;
     lcd_bus_delay();
 }
 
+void lcd_write_cmd(uint8_t cmd)
+{
+    lcd_bus_acquire();
+    lcd_write_cmd_raw(cmd);
+    lcd_bus_release();
+}
+
+void lcd_write_data(uint16_t data)
+{
+    lcd_bus_acquire();
+    lcd_write_data_raw(data);
+    lcd_bus_release();
+}
+
+void lcd_write_data8(uint8_t data)
+{
+    lcd_bus_acquire();
+    lcd_write_data8_raw(data);
+    lcd_bus_release();
+}
+
 uint16_t lcd_read_data(void)
 {
-    return *LCD_DATA_ADDR;
+    lcd_bus_acquire();
+    uint16_t value = *LCD_DATA_ADDR;
+    lcd_bus_release();
+    return value;
 }
 
 /* ========================================================================
@@ -550,33 +834,36 @@ void lcd_init(void)
  * ======================================================================== */
 void lcd_set_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
+    if (w == 0 || h == 0) return;
+    lcd_bus_acquire();
     uint16_t x_end = x + w - 1;
     uint16_t y_end = y + h - 1;
 
     /* Column Address Set (0x2A): start_col[15:8], start_col[7:0],
      *                            end_col[15:8], end_col[7:0] */
-    lcd_write_cmd(ST7789_CASET);
-    lcd_write_data8(x >> 8);
-    lcd_write_data8(x & 0xFF);
-    lcd_write_data8(x_end >> 8);
-    lcd_write_data8(x_end & 0xFF);
+    lcd_write_cmd_raw(ST7789_CASET);
+    lcd_write_data8_raw(x >> 8);
+    lcd_write_data8_raw(x & 0xFF);
+    lcd_write_data8_raw(x_end >> 8);
+    lcd_write_data8_raw(x_end & 0xFF);
 
     /* Row Address Set (0x2B): start_row[15:8], start_row[7:0],
      *                         end_row[15:8], end_row[7:0] */
-    lcd_write_cmd(ST7789_RASET);
-    lcd_write_data8(y >> 8);
-    lcd_write_data8(y & 0xFF);
-    lcd_write_data8(y_end >> 8);
-    lcd_write_data8(y_end & 0xFF);
+    lcd_write_cmd_raw(ST7789_RASET);
+    lcd_write_data8_raw(y >> 8);
+    lcd_write_data8_raw(y & 0xFF);
+    lcd_write_data8_raw(y_end >> 8);
+    lcd_write_data8_raw(y_end & 0xFF);
 
     /* Memory Write (0x2C): subsequent data writes go to framebuffer */
-    lcd_write_cmd(ST7789_RAMWR);
+    lcd_write_cmd_raw(ST7789_RAMWR);
 
     lcd_shadow_x = x;
     lcd_shadow_y = y;
     lcd_shadow_w = w;
     lcd_shadow_h = h;
     lcd_shadow_pos = 0;
+    lcd_bus_release();
 }
 
 /* ========================================================================
@@ -586,8 +873,10 @@ void lcd_set_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 void lcd_set_pixel(uint16_t x, uint16_t y, uint16_t color)
 {
     if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
+    lcd_bus_acquire();
     lcd_set_window(x, y, 1, 1);
-    lcd_write_data(color);
+    lcd_write_data_raw(color);
+    lcd_bus_release();
 }
 
 void lcd_blit_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *pixels)
@@ -600,14 +889,16 @@ void lcd_blit_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_
     if (h > LCD_HEIGHT - y) h = LCD_HEIGHT - y;
     if (w == 0 || h == 0) return;
 
+    lcd_bus_acquire();
     lcd_set_window(x, y, w, h);
 
     for (uint16_t row = 0; row < h; row++) {
         const uint16_t *src = pixels + (uint32_t)row * src_w;
         for (uint16_t col = 0; col < w; col++) {
-            lcd_write_data(src[col]);
+            lcd_write_data_raw(src[col]);
         }
     }
+    lcd_bus_release();
 }
 
 void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
@@ -615,13 +906,16 @@ void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t colo
     if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
     if (w > LCD_WIDTH - x) w = LCD_WIDTH - x;
     if (h > LCD_HEIGHT - y) h = LCD_HEIGHT - y;
+    if (w == 0 || h == 0) return;
 
+    lcd_bus_acquire();
     lcd_set_window(x, y, w, h);
 
     uint32_t total = (uint32_t)w * h;
     for (uint32_t i = 0; i < total; i++) {
-        lcd_write_data(color);
+        lcd_write_data_raw(color);
     }
+    lcd_bus_release();
 }
 
 void lcd_write_pixels(const uint16_t *pixels, uint32_t count)
@@ -629,8 +923,11 @@ void lcd_write_pixels(const uint16_t *pixels, uint32_t count)
     /* No window setup here by design — the caller owns the window, which is
      * the entire point (see lcd.h). Writes go straight at the EXMC data
      * address with no bus delay, exactly like the lcd_fill_rect() inner loop. */
+    if (pixels == NULL || count == 0) return;
+    lcd_bus_acquire();
     while (count--)
         *LCD_DATA_ADDR = *pixels++;
+    lcd_bus_release();
 }
 
 void lcd_clear(uint16_t color)
@@ -655,32 +952,36 @@ void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg)
 
     const uint8_t *glyph = font_8x16[c - 0x20];
 
+    lcd_bus_acquire();
     lcd_set_window(x, y, FONT_WIDTH, FONT_HEIGHT);
 
     for (int row = 0; row < FONT_HEIGHT; row++) {
         uint8_t line = glyph[row];
         for (int col = 0; col < FONT_WIDTH; col++) {
             if (line & (0x80 >> col)) {
-                lcd_write_data(fg);
+                lcd_write_data_raw(fg);
             } else {
-                lcd_write_data(bg);
+                lcd_write_data_raw(bg);
             }
         }
     }
+    lcd_bus_release();
 }
 
 void lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t fg, uint16_t bg)
 {
+    lcd_bus_acquire();
     while (*str) {
         if (x + FONT_WIDTH > LCD_WIDTH) {
             x = 0;
             y += FONT_HEIGHT;
-            if (y + FONT_HEIGHT > LCD_HEIGHT) return;
+            if (y + FONT_HEIGHT > LCD_HEIGHT) break;
         }
         lcd_draw_char(x, y, *str, fg, bg);
         x += FONT_WIDTH;
         str++;
     }
+    lcd_bus_release();
 }
 
 /* ========================================================================
@@ -699,8 +1000,10 @@ void lcd_display_off(void)
 
 void lcd_set_orientation(uint8_t madctl)
 {
-    lcd_write_cmd(ST7789_MADCTL);
-    lcd_write_data8(madctl);
+    lcd_bus_acquire();
+    lcd_write_cmd_raw(ST7789_MADCTL);
+    lcd_write_data8_raw(madctl);
+    lcd_bus_release();
 }
 
 void lcd_set_brightness(uint8_t level)

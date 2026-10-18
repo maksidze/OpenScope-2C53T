@@ -1,8 +1,22 @@
 # ESP32 Co-Processor: Architecture & Spec
 
+> **Protocol note (2026-08-23):** the `0xAA / command / XOR` protocol below is
+> an early, unwired prototype.  It is superseded for new implementation work
+> by [ESP32-Link Activity Runtime](esp32_link_activity_runtime.md), which
+> specifies asynchronous COBS/CRC32C transport, runtime Activity markup,
+> assets, native measurement telemetry, input lifecycle, and POWER safety.
+> The networking and physical
+> integration ideas in this document remain background material; its UART ABI
+> is not a compatibility target.
+
 ## Overview
 
-The ESP32-S3 (or ESP32-C3) module is soldered inside the 2C53T case with 4 wires (3.3V, GND, UART TX, UART RX). It runs its own firmware and communicates with the scope MCU (GD32F307) via a simple UART protocol. The ESP32 handles everything network-related — the scope MCU never touches WiFi, BLE, or HTTP.
+The ESP32-S3 (or ESP32-C3) module is installed inside the 2C53T case and runs
+its own firmware.  The confirmed design target is the AT32F403A host connected
+through PE0/PE1 (UART8), plus 3.3 V and ground.  ESP handles Wi-Fi, BLE, HTTP,
+and other external protocols; the AT32 remains the instrument and display/input
+host.  See the superseding Activity Runtime document above for the normative
+link and UI architecture.
 
 ## Hardware
 

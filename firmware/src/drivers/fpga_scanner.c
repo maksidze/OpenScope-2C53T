@@ -248,12 +248,14 @@ static void scan_keepalive(void)
 static void scan_draw_header(const char *tier_name)
 {
     const theme_t *th = theme_get();
+    lcd_transaction_begin();
     lcd_fill_rect(0, 0, 320, 240, th->background);
 
     font_draw_string(4, 2, "FPGA SPI SCANNER", th->highlight, th->background,
                      &font_medium);
     font_draw_string(4, 20, tier_name, th->text_primary, th->background,
                      &font_small);
+    lcd_transaction_end();
 }
 
 static void scan_draw_progress(uint32_t current, uint32_t total,
@@ -263,6 +265,7 @@ static void scan_draw_progress(uint32_t current, uint32_t total,
     const theme_t *th = theme_get();
     char buf[48];
     uint16_t bg = th->background;
+    lcd_transaction_begin();
 
     /* Progress bar */
     uint16_t bar_x = 4, bar_y = 38, bar_w = 312, bar_h = 14;
@@ -303,6 +306,7 @@ static void scan_draw_progress(uint32_t current, uint32_t total,
              (unsigned long)(secs % 60));
     lcd_fill_rect(164, 88, 152, 14, bg);
     font_draw_string(164, 88, buf, th->text_secondary, bg, &font_small);
+    lcd_transaction_end();
 }
 
 static void scan_draw_hit(uint16_t idx)
@@ -312,6 +316,7 @@ static void scan_draw_hit(uint16_t idx)
     const scanner_hit_t *h = &hits[idx];
     char buf[48];
     uint16_t bg = th->background;
+    lcd_transaction_begin();
 
     /* Show latest hit at fixed position */
     uint16_t y = 106;
@@ -327,6 +332,7 @@ static void scan_draw_hit(uint16_t idx)
              (unsigned long)h->gpio_delta);
     lcd_fill_rect(4, y + 14, 312, 14, bg);
     font_draw_string(4, y + 14, buf, th->ch1, bg, &font_small);
+    lcd_transaction_end();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -849,6 +855,7 @@ static void scan_draw_results(bool aborted)
     const theme_t *th = theme_get();
     char buf[48];
     uint16_t bg = th->background;
+    lcd_transaction_begin();
 
     lcd_fill_rect(0, 0, 320, 240, bg);
 
@@ -901,6 +908,7 @@ static void scan_draw_results(bool aborted)
 
     font_draw_string(4, 224, "Press any button to exit",
                      th->text_secondary, bg, &font_small);
+    lcd_transaction_end();
 }
 
 /* ═══════════════════════════════════════════════════════════════════

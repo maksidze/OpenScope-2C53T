@@ -47,6 +47,9 @@ extern void system_clock_config(void);
 #include "fault.h"
 #include "redraw_gate.h"
 #include "scope_mask.h"
+#include "esp_link.h"
+#include "esp_activity.h"
+#include "task_stack_budget.h"
 
 /* ═══════════════════════════════════════════════════════════════════
  * Global State (extern'd via ui.h for UI modules)
@@ -458,6 +461,7 @@ static void vDisplayTask(void *pvParameters)
     vTaskDelay(pdMS_TO_TICKS(750));
 
     /* Initial draw */
+    lcd_transaction_begin();
     lcd_clear(COLOR_BLACK);
     draw_status_bar();
     draw_info_bar();
@@ -466,6 +470,7 @@ static void vDisplayTask(void *pvParameters)
     } else {
         draw_scope_screen(0);
     }
+    lcd_transaction_end();
 
     for (;;) {
         /* Track mode transitions: for SPI3 acquisition warmup, and to
@@ -474,6 +479,8 @@ static void vDisplayTask(void *pvParameters)
          * from the last time it was visible. Hoisted above the queue
          * handling (2026-08-13) so a DCMD arriving on the same tick as a
          * mode switch sees an already-invalidated gate. */
+        if(current_mode!=MODE_SETTINGS || settings_depth!=7)
+            esp_activity_display_leave();
         static device_mode_t last_rendered_mode = (device_mode_t)0xFF;
         static uint32_t scope_entered_frame = 0;
         if (current_mode != last_rendered_mode) {
@@ -502,6 +509,8 @@ static void vDisplayTask(void *pvParameters)
         if (xQueueReceive(xDisplayQueue, &cmd, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (ui_modal_active)
                 cmd = DCMD_NONE_MODAL_DROP;
+            if (cmd != DCMD_NONE_MODAL_DROP)
+                lcd_transaction_begin();
             switch (cmd) {
             case DCMD_DRAW_SPLASH:
                 draw_splash();
@@ -593,6 +602,8 @@ static void vDisplayTask(void *pvParameters)
             default:
                 break;
             }
+            if (cmd != DCMD_NONE_MODAL_DROP)
+                lcd_transaction_end();
         }
 
         /* Check in with health monitor */
@@ -634,6 +645,11 @@ static void vDisplayTask(void *pvParameters)
                 draw_info_bar();
                 g_info_bar_epoch = ib;
             }
+        }
+        if (current_mode == MODE_SETTINGS && settings_depth == 7) {
+            /* UART/link tasks only queue validated model records. LVGL and
+             * the LCD remain owned exclusively by this display task. */
+            esp_activity_display_service();
         }
         if (current_mode == MODE_OSCILLOSCOPE) {
             const scope_state_t *ss_anim = scope_state_get();
@@ -726,8 +742,11 @@ static void vDisplayTask(void *pvParameters)
                 redraw_action_t act = redraw_gate_step(&scope_gate, &q);
                 if (act == REDRAW_SKIP)
                     ui_scope_skipped++;
-                else
+                else {
+                    lcd_transaction_begin();
                     scope_render(frame, act);
+                    lcd_transaction_end();
+                }
             }
         } else if (current_mode == MODE_SIGNAL_GEN) {
             /* Siggen UI is static: no animation, no live data. It is
@@ -751,7 +770,9 @@ static void vDisplayTask(void *pvParameters)
             if (!auto_select_running &&
                 (submode_changed || ((uc != last_meter_update) && enough_time) ||
                  periodic_due)) {
+                lcd_transaction_begin();
                 draw_meter_screen();
+                lcd_transaction_end();
                 last_meter_update = meter_screen_last_reading_display_update;
                 last_meter_frame  = frame;
                 last_meter_submode = meter_submode;
@@ -821,6 +842,7 @@ static void vInputTask(void *pvParameters)
         if (xQueueReceive(xInputQueue, &pressed, pdMS_TO_TICKS(100)) == pdTRUE) {
             input_handle_button(pressed, xDisplayQueue);
         }
+        input_service_remote_mode(xDisplayQueue);
 
         /* Check in with health monitor */
         health_checkin(health_slot_input);
@@ -1166,7 +1188,7 @@ int main(void)
     button_scan_init(xInputQueue);
 
     /* Create tasks */
-    xTaskCreate(vDisplayTask, "display", 768, NULL, 1, &xDisplayTaskHandle);
+    xTaskCreate(vDisplayTask, "display", DISPLAY_TASK_STACK_WORDS, NULL, 1, &xDisplayTaskHandle);
     xTaskCreate(vInputTask,   "key",     384, NULL, 4, &xInputTaskHandle);
 
     /* Register tasks with health monitor */
@@ -1204,6 +1226,38 @@ int main(void)
     if (xHealthTimer != NULL) {
         xTimerStart(xHealthTimer, 0);
     }
+
+#ifndef EMULATOR_BUILD
+    /* The bridge transport gets priority over the optional ESP Activity UI.
+     * All native queues/tasks/timers above are created first. The scheduler
+     * will still dynamically allocate Idle and Timer-service task stacks and
+     * TCBs, so reserve their exact heap_4 block costs plus 1 KiB operational
+     * headroom. If the preflight fails, do not call pvPortMalloc at all and do
+     * not configure the optional runtime. On cut-track hardware a missing
+     * bridge means no meter traffic; scope SPI3 remains a separate path.
+     * Native boot commands used the same bridge envelope in polling mode. */
+#define HEAP4_BLOCK_BYTES(n) (((size_t)(n) + 15u) & ~(size_t)7u)
+    const size_t kernel_task_reserve =
+        HEAP4_BLOCK_BYTES(configMINIMAL_STACK_SIZE * sizeof(StackType_t)) +
+        HEAP4_BLOCK_BYTES(sizeof(StaticTask_t)) +
+        HEAP4_BLOCK_BYTES(configTIMER_TASK_STACK_DEPTH * sizeof(StackType_t)) +
+        HEAP4_BLOCK_BYTES(sizeof(StaticTask_t));
+    const size_t esp_need = esp_link_heap_required();
+    const size_t runtime_headroom = 1024u;
+    if (xPortGetFreeHeapSize() >= esp_need + kernel_task_reserve +
+                                  runtime_headroom) {
+        if (esp_link_init() && esp_link_create_task()) {
+            /* In a cut-track installation forwarding is essential; the
+             * launcher/LVGL model is optional. Allocate it AFTER the link. */
+            if (xPortGetFreeHeapSize() >= esp_activity_heap_required() +
+                       kernel_task_reserve + runtime_headroom)
+                (void)esp_activity_init();
+        }
+    } else {
+        esp_link_note_preflight_failure();
+    }
+#undef HEAP4_BLOCK_BYTES
+#endif
 
     /* Boot validation: tell the bootloader we started successfully.
      * Clears the boot attempt counter so we won't enter safe mode on

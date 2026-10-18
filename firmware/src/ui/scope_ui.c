@@ -2498,6 +2498,7 @@ void draw_scope_live_frame(void)
 
         for (uint8_t sg = 0; sg < nseg; sg++) {
         if (seg_bot[sg] <= seg_top[sg]) continue;
+        lcd_transaction_begin();
         lcd_set_window(x, seg_top[sg], 1, (uint16_t)(seg_bot[sg] - seg_top[sg]));
         for (uint16_t y = seg_top[sg]; y < seg_bot[sg]; y++) {
             uint16_t c;
@@ -2528,6 +2529,7 @@ void draw_scope_live_frame(void)
                 c = th->background;
             lcd_write_data(c);
         }
+        lcd_transaction_end();
         }
     }
 
@@ -3125,12 +3127,14 @@ void draw_waterfall_screen(void)
         for (x = 0; x < WATERFALL_COLS; x++)
             waterfall_line[x] = intensity_to_color(src[x]);
 
+        lcd_transaction_begin();
         lcd_set_window(0, (uint16_t)(SCOPE_TOP + r * row_height),
                        WATERFALL_COLS, row_height);
 
         uint16_t rep;
         for (rep = 0; rep < row_height; rep++)
             lcd_write_pixels(waterfall_line, WATERFALL_COLS);
+        lcd_transaction_end();
     }
 
     /* Say which signal built this history. A waterfall of a compiled-in test

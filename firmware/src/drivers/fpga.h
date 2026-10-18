@@ -34,7 +34,14 @@
  * USART Protocol Constants
  * ═══════════════════════════════════════════════════════════════════ */
 
+#ifdef ESP_LINK_BRIDGE
+#include "esp_link.h"
+#define FPGA_USART_BAUD       ESP_LINK_BAUD
+#else
 #define FPGA_USART_BAUD       9600
+#endif
+/* Byte parser shared by native USART ISR and bridge delivery in task context. */
+void fpga_uart_receive_byte(uint8_t byte, bool from_isr);
 #define FPGA_TX_FRAME_SIZE    10
 #define FPGA_TX_FRAME_HISTORY 16
 #define FPGA_RX_FRAME_SIZE    12

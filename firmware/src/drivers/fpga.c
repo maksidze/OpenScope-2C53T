@@ -244,9 +244,11 @@ static void fpga_meter_reset_transport(void)
      * guess here.
      */
     ctrl1 = USART2->ctrl1;
+#ifndef ESP_LINK_BRIDGE
     USART2->ctrl1 = ctrl1 & ~(USART_CTRL1_UEN |
                               USART_CTRL1_RDBFIEN |
                               USART_CTRL1_TDBEIEN);
+#endif
 
     if (tx_task_handle != NULL) vTaskSuspend(tx_task_handle);
     if (rx_task_handle != NULL) vTaskSuspend(rx_task_handle);
@@ -259,14 +261,20 @@ static void fpga_meter_reset_transport(void)
     fpga.tx_index = 0;
     fpga.rx_index = 0;
     fpga.rx_frame_valid = false;
+#ifndef ESP_LINK_BRIDGE
     (void)USART2->sts;
     (void)USART2->dt;
+#endif
 
     GPIOC->clr = (1U << 11);
     fpga_scope_delay_ms(20);
 
+#ifndef ESP_LINK_BRIDGE
     USART2->ctrl1 = (ctrl1 | USART_CTRL1_UEN | USART_CTRL1_RDBFIEN) &
                     ~USART_CTRL1_TDBEIEN;
+#else
+    (void)ctrl1; /* Shared UART must keep carrying OSLP during mode changes. */
+#endif
     /*
      * Do not inherit a dead transceiver (EXP-205, unit #2). On a silent-scope
      * build, scope entry parks USART2 with ctrl1 = 0 and the IRQ masked. When
@@ -931,6 +939,7 @@ static void spi3_set_br(uint32_t br)
  * USART2 Byte-Level TX (used during boot, before tasks are running)
  * ═══════════════════════════════════════════════════════════════════ */
 
+#ifndef ESP_LINK_BRIDGE
 static void usart2_send_byte(uint8_t b)
 {
     volatile uint32_t timeout = 100000;
@@ -939,9 +948,13 @@ static void usart2_send_byte(uint8_t b)
     }
     USART2->dt = b;
 }
+#endif
 
 static void usart2_send_frame(const uint8_t *frame)
 {
+#ifdef ESP_LINK_BRIDGE
+    (void)esp_link_meter_send(frame, FPGA_TX_FRAME_SIZE);
+#else
     for (int i = 0; i < FPGA_TX_FRAME_SIZE; i++) {
         usart2_send_byte(frame[i]);
     }
@@ -950,6 +963,7 @@ static void usart2_send_frame(const uint8_t *frame)
     while (!(USART2->sts & USART_TDC_FLAG)) {
         if (--timeout == 0) break;
     }
+#endif
 }
 
 static void fpga_record_tx_cmd(uint8_t cmd_hi, uint8_t cmd_lo)
@@ -2327,6 +2341,9 @@ void fpga_scope_heartbeat(void)
 
 void USART2_IRQHandler(void)
 {
+#ifdef ESP_LINK_BRIDGE
+    esp_link_uart_irq();
+#else
     /* TX: send next byte from frame buffer */
     if ((USART2->ctrl1 & USART_CTRL1_TDBEIEN) && (USART2->sts & USART_TDBE_FLAG)) {
         if (fpga.tx_index < FPGA_TX_FRAME_SIZE) {
@@ -2339,8 +2356,15 @@ void USART2_IRQHandler(void)
 
     /* RX: receive and assemble frame */
     if (USART2->sts & USART_RDBF_FLAG) {
+        fpga_uart_receive_byte((uint8_t)USART2->dt, true);
+    }
+#endif
+}
+
+void fpga_uart_receive_byte(uint8_t byte, bool from_isr)
+{
+    {
         fpga.rx_byte_count++;
-        uint8_t byte = (uint8_t)USART2->dt;
         uint8_t rx_index_before = fpga.rx_index;
 
         /*
@@ -2449,10 +2473,13 @@ void USART2_IRQHandler(void)
                 /* Hand complete frame ownership to dvom_RX (only if RTOS is running). */
                 if (meter_rx_queue != NULL &&
                     xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
-                    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-                    (void)xQueueSendFromISR(meter_rx_queue, &event,
-                                            &xHigherPriorityTaskWoken);
-                    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+                    if (from_isr) {
+                        BaseType_t higher = pdFALSE;
+                        (void)xQueueSendFromISR(meter_rx_queue, &event, &higher);
+                        portYIELD_FROM_ISR(higher);
+                    } else {
+                        (void)xQueueSend(meter_rx_queue, &event, 0);
+                    }
                 }
 
             } else if (fpga.rx_buf[0] == FPGA_RX_ECHO_HDR_0 &&
@@ -2537,7 +2564,15 @@ static void fpga_usart_tx_task(void *pv)
         fpga_record_tx_frame((const uint8_t *)fpga.tx_frame);
 
         /* Enable TX interrupt — ISR pumps all 10 bytes */
+#ifdef ESP_LINK_BRIDGE
+        /* The ESP acknowledges AFTER its 9600-baud UART is physically idle.
+         * This prevents a 115200-baud producer outrunning the slow consumer.
+         * A timeout is diagnostic, never permission to duplicate a command. */
+        (void)esp_link_meter_send((const uint8_t *)fpga.tx_frame, FPGA_TX_FRAME_SIZE);
+        fpga.tx_index = FPGA_TX_FRAME_SIZE;
+#else
         USART2->ctrl1 |= USART_CTRL1_TDBEIEN;
+#endif
 
         /* Wait for transmission before accepting next command */
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -3591,6 +3626,9 @@ static volatile uint8_t acq_rate_idx     = 0x08;
  * THE REGISTERS BACK so the precondition is verified rather than assumed. */
 void fpga_usart_scope_enable(bool on)
 {
+#ifdef ESP_LINK_BRIDGE
+    (void)on; /* Scope/meter changes must not disable the ESP transport. */
+#else
     if (on) {
         USART2->ctrl1 = 0;
         USART2->baudr = system_core_clock / 2 / FPGA_USART_BAUD;
@@ -3604,7 +3642,14 @@ void fpga_usart_scope_enable(bool on)
         NVIC_DisableIRQ(USART2_IRQn);
         USART2->ctrl1 = 0;
     }
+#endif
 }
+
+#ifdef ESP_LINK_BRIDGE
+#define FPGA_TX_TASK_STACK 256u /* Includes bounded pre-runtime polling path. */
+#else
+#define FPGA_TX_TASK_STACK 64u
+#endif
 
 uint32_t fpga_usart_ctrl1(void) { return USART2->ctrl1; }
 uint32_t fpga_usart_baudr(void) { return USART2->baudr; }
@@ -6229,7 +6274,7 @@ QueueHandle_t fpga_create_tasks(void)
      * gated on current_mode == MODE_MULTIMETER, so scope mode still sees a quiet
      * wire. Without them PC11 high produces an audible relay click and a frozen
      * DMM screen: nothing polls, nothing decodes. */
-    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   64,  NULL, 2, &tx_task_handle);
+    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   FPGA_TX_TASK_STACK, NULL, 2, &tx_task_handle);
     xTaskCreate(fpga_usart_rx_task,    "dvom_RX",   128, NULL, 3, &rx_task_handle);
     /* 192, not 64: function changes (fpga_set_meter_mode) now run here. */
     xTaskCreate(fpga_meter_poll_task,  "meter_poll", 192, NULL, 2, &meter_poll_handle);
@@ -6241,7 +6286,7 @@ QueueHandle_t fpga_create_tasks(void)
     (void)tx_task_handle; (void)rx_task_handle; (void)acq_task_handle;
 #else
     /* Create tasks (stack sizes and priorities match stock firmware) */
-    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   64,  NULL, 2, &tx_task_handle);
+    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   FPGA_TX_TASK_STACK, NULL, 2, &tx_task_handle);
     xTaskCreate(fpga_usart_rx_task,    "dvom_RX",   128, NULL, 3, &rx_task_handle);
     xTaskCreate(fpga_acquisition_task, "fpga",      256, NULL, 3, &acq_task_handle);
     xTaskCreate(fpga_meter_poll_task,  "meter_poll", 192, NULL, 2, &meter_poll_handle);

@@ -23,6 +23,9 @@
  * Returns the display command sent (or 0 if none).
  */
 uint8_t input_handle_button(button_id_t button, QueueHandle_t display_queue);
+/* Remote requests use a bounded mailbox; only the input task changes modes. */
+bool input_request_mode(device_mode_t mode);
+void input_service_remote_mode(QueueHandle_t display_queue);
 
 /*
  * Handle OK press in settings menu (top-level and sub-menus).

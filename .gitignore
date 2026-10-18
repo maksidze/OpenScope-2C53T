@@ -24,6 +24,10 @@ FNIRSI_1014D_Firmware/
 
 # Build output
 firmware/build/
+/.build-esp32-bridge/
+/esp32-bridge-build.log
+/firmware/build-bridge*.log
+/firmware/test-tools-install.log
 firmware/bootloader/build/
 firmware/stock_dispatcher/build/
 
@@ -65,10 +69,12 @@ firmware/FreeRTOS/
 firmware/gd32f30x_lib/
 firmware/at32f403a_lib/
 firmware/at32f403a_gcc/
+firmware/lvgl/
 firmware/FreeRTOS
 firmware/gd32f30x_lib
 firmware/at32f403a_lib
 firmware/at32f403a_gcc
+firmware/lvgl
 
 # Python
 **/__pycache__/

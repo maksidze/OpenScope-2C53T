@@ -200,6 +200,7 @@ void draw_splash(void)
 #ifdef SPLASH_IMAGE_H
     /* Stream the RLE image straight into one full-screen window. Records are
      * (uint8 run, uint16 LE color); runs cross row boundaries freely. */
+    lcd_transaction_begin();
     lcd_set_window(0, 0, SPLASH_IMAGE_WIDTH, SPLASH_IMAGE_HEIGHT);
     const uint8_t *p   = splash_image_rle;
     const uint8_t *end = splash_image_rle + sizeof(splash_image_rle);
@@ -210,6 +211,7 @@ void draw_splash(void)
         while (run--)
             lcd_write_data(color);
     }
+    lcd_transaction_end();
 #else
     lcd_clear(COLOR_BLACK);
 
